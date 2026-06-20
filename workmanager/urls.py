@@ -29,6 +29,9 @@ from .views import (
     TaskReportAPIView,
     TaskViewSet,
     WorkMemberViewSet,
+    NoteViewSet,
+    DocumentCategoryViewSet,
+    DocumentViewSet
 )
 
 router = DefaultRouter()
@@ -39,6 +42,9 @@ router.register(r"meetings", MeetingViewSet, basename="meetings")
 router.register(r"leave", LeaveRecordViewSet, basename="leave")
 router.register(r"salary", SalaryRecordViewSet, basename="salary")
 router.register(r"emails", EmailLogViewSet, basename="emails")
+router.register(r"notes", NoteViewSet, basename="notes")
+router.register(r"document-categories", DocumentCategoryViewSet, basename="document-categories")
+router.register(r"documents", DocumentViewSet, basename="documents")
 
 # Management pages
 router.register(r"management/jobs", JobViewSet, basename="management-jobs")

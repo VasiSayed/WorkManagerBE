@@ -13,6 +13,7 @@ from rest_framework.views import APIView
 
 from .email_utils import render_template_text
 from .models import (
+        Note,Document,DocumentCategory,
     Attachment,
     DesignationHistory,
     EmailLog,
@@ -36,6 +37,7 @@ from .serializers import (
     DesignationHistorySerializer,
     EmailLogSerializer,
     EmailTemplateSerializer,
+    NoteSerializer,DocumentCategorySerializer,DocumentSerializer,
     EmailVariableSerializer,
     EmailTypeSerializer,
     FreelanceSourceSerializer,
@@ -1298,3 +1300,129 @@ class OptionsAPIView(APIView):
             "email_statuses": EmailLog.Status.choices,
             "email_variable_categories": EmailVariable.Category.choices,
         })
+
+
+class NoteViewSet(OwnedModelViewSet):
+    queryset = Note.objects.select_related(
+        "job",
+        "freelance_source",
+        "project",
+    ).prefetch_related("members")
+    serializer_class = NoteSerializer
+    search_fields = [
+        "label",
+        "description",
+        "job__company_name",
+        "freelance_source__name",
+        "project__name",
+    ]
+    ordering_fields = [
+        "label",
+        "status",
+        "data_type",
+        "created_at",
+        "updated_at",
+    ]
+
+    def apply_common_filters(self, queryset):
+        queryset = super().apply_common_filters(queryset)
+        params = self.request.query_params
+
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+
+        if params.get("data_type"):
+            queryset = queryset.filter(data_type=params["data_type"])
+
+        if params.get("is_active") in ["true", "false"]:
+            queryset = queryset.filter(is_active=params["is_active"] == "true")
+
+        if params.get("job"):
+            queryset = queryset.filter(job_id=params["job"])
+
+        if params.get("freelance_source"):
+            queryset = queryset.filter(freelance_source_id=params["freelance_source"])
+
+        if params.get("project"):
+            queryset = queryset.filter(project_id=params["project"])
+
+        if params.get("member"):
+            queryset = queryset.filter(members__id=params["member"])
+
+        return queryset.distinct()
+
+
+class DocumentCategoryViewSet(OwnedModelViewSet):
+    queryset = DocumentCategory.objects.select_related("parent")
+    serializer_class = DocumentCategorySerializer
+    search_fields = [
+        "name",
+        "description",
+        "parent__name",
+    ]
+    ordering_fields = [
+        "name",
+        "created_at",
+        "updated_at",
+    ]
+
+    def apply_common_filters(self, queryset):
+        queryset = super().apply_common_filters(queryset)
+        params = self.request.query_params
+
+        if params.get("is_active") in ["true", "false"]:
+            queryset = queryset.filter(is_active=params["is_active"] == "true")
+
+        if params.get("parent"):
+            queryset = queryset.filter(parent_id=params["parent"])
+
+        if params.get("root") in ["true", "1"]:
+            queryset = queryset.filter(parent__isnull=True)
+
+        return queryset
+
+
+class DocumentViewSet(OwnedModelViewSet):
+    queryset = Document.objects.select_related(
+        "category",
+        "job",
+        "freelance_source",
+        "project",
+    )
+    serializer_class = DocumentSerializer
+    search_fields = [
+        "name",
+        "description",
+        "category__name",
+        "job__company_name",
+        "freelance_source__name",
+        "project__name",
+    ]
+    ordering_fields = [
+        "name",
+        "created_at",
+        "updated_at",
+    ]
+
+    def apply_common_filters(self, queryset):
+        queryset = super().apply_common_filters(queryset)
+        params = self.request.query_params
+
+        if params.get("is_active") in ["true", "false"]:
+            queryset = queryset.filter(is_active=params["is_active"] == "true")
+
+        if params.get("category"):
+            queryset = queryset.filter(category_id=params["category"])
+
+        if params.get("job"):
+            queryset = queryset.filter(job_id=params["job"])
+
+        if params.get("freelance_source"):
+            queryset = queryset.filter(freelance_source_id=params["freelance_source"])
+
+        if params.get("project"):
+            queryset = queryset.filter(project_id=params["project"])
+
+        return queryset
+    
+    

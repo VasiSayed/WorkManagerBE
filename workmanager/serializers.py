@@ -21,6 +21,7 @@ from .models import (
     SalaryRule,
     Task,
     WorkMember,
+    Note,Document,DocumentCategory
 )
 
 
@@ -589,3 +590,216 @@ class AttachmentSerializer(serializers.ModelSerializer):
         model = Attachment
         fields = ["id", "module", "object_id", "title", "file", "notes", "created_at", "updated_at"]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+
+
+from rest_framework import serializers
+
+
+class NoteSerializer(serializers.ModelSerializer):
+    job = OwnerPrimaryKeyRelatedField(
+        queryset=Job.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    freelance_source = OwnerPrimaryKeyRelatedField(
+        queryset=FreelanceSource.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    project = OwnerPrimaryKeyRelatedField(
+        queryset=Project.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    members = OwnerPrimaryKeyRelatedField(
+        queryset=WorkMember.objects.all(),
+        many=True,
+        required=False,
+    )
+
+    job_name = serializers.CharField(source="job.company_name", read_only=True)
+    freelance_source_name = serializers.CharField(source="freelance_source.name", read_only=True)
+    project_name = serializers.CharField(source="project.name", read_only=True)
+
+    class Meta:
+        model = Note
+        fields = [
+            "id",
+            "label",
+            "description",
+            "job",
+            "job_name",
+            "freelance_source",
+            "freelance_source_name",
+            "project",
+            "project_name",
+            "members",
+            "data_type",
+            "data",
+            "status",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "job_name",
+            "freelance_source_name",
+            "project_name",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate(self, attrs):
+        data_type = attrs.get("data_type", getattr(self.instance, "data_type", None))
+        data = attrs.get("data", getattr(self.instance, "data", None))
+
+        if data in ("", None):
+            attrs["data"] = {}
+
+        if data_type == Note.DataType.PLAIN and data and not isinstance(data, (dict, str)):
+            raise serializers.ValidationError({
+                "data": "For plain note, data should be object or string."
+            })
+
+        if data_type in [Note.DataType.POINTS, Note.DataType.CHECKLIST] and data and not isinstance(data, list):
+            raise serializers.ValidationError({
+                "data": "For points/checklist note, data should be a list."
+            })
+
+        if data_type == Note.DataType.TABLE and data and not isinstance(data, dict):
+            raise serializers.ValidationError({
+                "data": "For table note, data should be an object with columns and rows."
+            })
+
+        return attrs
+
+    def create(self, validated_data):
+        members = validated_data.pop("members", [])
+        note = Note.objects.create(**validated_data)
+        if members:
+            note.members.set(members)
+        return note
+
+    def update(self, instance, validated_data):
+        members = validated_data.pop("members", None)
+        instance = super().update(instance, validated_data)
+        if members is not None:
+            instance.members.set(members)
+        return instance
+
+
+class DocumentCategorySerializer(serializers.ModelSerializer):
+    parent = OwnerPrimaryKeyRelatedField(
+        queryset=DocumentCategory.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    parent_name = serializers.CharField(source="parent.name", read_only=True)
+
+    class Meta:
+        model = DocumentCategory
+        fields = [
+            "id",
+            "name",
+            "parent",
+            "parent_name",
+            "description",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "parent_name",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate(self, attrs):
+        parent = attrs.get("parent", getattr(self.instance, "parent", None))
+
+        if self.instance and parent and parent.id == self.instance.id:
+            raise serializers.ValidationError({
+                "parent": "Category cannot be parent of itself."
+            })
+
+        return attrs
+
+
+class DocumentSerializer(serializers.ModelSerializer):
+    category = OwnerPrimaryKeyRelatedField(
+        queryset=DocumentCategory.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    job = OwnerPrimaryKeyRelatedField(
+        queryset=Job.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    freelance_source = OwnerPrimaryKeyRelatedField(
+        queryset=FreelanceSource.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    project = OwnerPrimaryKeyRelatedField(
+        queryset=Project.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    job_name = serializers.CharField(source="job.company_name", read_only=True)
+    freelance_source_name = serializers.CharField(source="freelance_source.name", read_only=True)
+    project_name = serializers.CharField(source="project.name", read_only=True)
+    document_url = serializers.CharField(read_only=True)
+    document_path = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = Document
+        fields = [
+            "id",
+            "name",
+            "description",
+            "category",
+            "category_name",
+            "job",
+            "job_name",
+            "freelance_source",
+            "freelance_source_name",
+            "project",
+            "project_name",
+            "document_file",
+            "document_path",
+            "document_url",
+            "external_url",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "category_name",
+            "job_name",
+            "freelance_source_name",
+            "project_name",
+            "document_path",
+            "document_url",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate(self, attrs):
+        document_file = attrs.get("document_file", getattr(self.instance, "document_file", None))
+        external_url = attrs.get("external_url", getattr(self.instance, "external_url", ""))
+
+        if not document_file and not external_url:
+            raise serializers.ValidationError({
+                "document_file": "Upload document file or provide external_url."
+            })
+
+        return attrs
+    
+    

@@ -11,20 +11,30 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Basic Config
 # =========================
 
+SECRET_KEY = config("SECRET_KEY", default="dev-only-change-me")
 DEBUG = config("DEBUG", default=False, cast=bool)
+
+# =========================
+# Hosts / Frontend Origins
+# =========================
 
 ALLOWED_HOSTS = config(
     "ALLOWED_HOSTS",
-    default="127.0.0.1,localhost",
+    default="127.0.0.1,localhost,work-manager-fe-w2u7.vercel.app",
     cast=Csv(),
 )
 
-CSRF_TRUSTED_ORIGINS = [
-    origin.strip()
-    for origin in config("CSRF_TRUSTED_ORIGINS", default="").split(",")
-    if origin.strip()
-]
+FRONTEND_ORIGINS = config(
+    "FRONTEND_ORIGINS",
+    default="http://localhost:5173,http://127.0.0.1:5173,https://work-manager-fe-w2u7.vercel.app",
+    cast=Csv(),
+)
 
+CORS_ALLOWED_ORIGINS = list(FRONTEND_ORIGINS)
+
+CSRF_TRUSTED_ORIGINS = list(FRONTEND_ORIGINS)
+
+CORS_ALLOW_CREDENTIALS = True
 
 # =========================
 # Apps
@@ -155,24 +165,6 @@ MEDIA_ROOT = BASE_DIR / "media"
 # =========================
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-
-
-# =========================
-# CORS
-# =========================
-
-CORS_ALLOWED_ORIGINS = config(
-    "CORS_ALLOWED_ORIGINS",
-    default=(
-        "http://localhost:5173,"
-        "http://localhost:5174,"
-        "http://127.0.0.1:5173,"
-        "http://127.0.0.1:5174"
-    ),
-    cast=Csv(),
-)
-
-CORS_ALLOW_CREDENTIALS = True
 
 
 # =========================

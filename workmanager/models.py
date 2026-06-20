@@ -575,3 +575,182 @@ class Attachment(OwnedModel):
 
     def __str__(self):
         return self.title or self.file.name
+
+
+
+from django.db import models
+from django.utils import timezone
+
+
+def document_upload_path(instance, filename):
+    owner_id = instance.owner_id or "unknown"
+    today = timezone.now().date()
+    return f"documents/{owner_id}/{today:%Y/%m/%d}/{filename}"
+
+
+class Note(OwnedModel):
+    class DataType(models.TextChoices):
+        PLAIN = "plain", "Plain"
+        POINTS = "points", "Point Wise"
+        TABLE = "table", "Table"
+        CHECKLIST = "checklist", "Checklist"
+        CUSTOM = "custom", "Custom"
+
+    class Status(models.TextChoices):
+        WILL_START = "will_start", "Will Start"
+        STARTED = "started", "Started"
+        PARTIAL_DONE = "partial_done", "Partial Done"
+        ALMOST_DONE = "almost_done", "Almost Done"
+        COMPLETED = "completed", "Completed"
+        CANCELLED = "cancelled", "Cancelled"
+
+    label = models.CharField(max_length=180)
+    description = models.TextField(blank=True)
+
+    job = models.ForeignKey(
+        Job,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+       related_name="note_records",
+    )
+    freelance_source = models.ForeignKey(
+        FreelanceSource,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="note_records",
+    )
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="note_records",
+    )
+
+    members = models.ManyToManyField(
+        WorkMember,
+        blank=True,
+        related_name="note_records",
+    )
+
+    data_type = models.CharField(
+        max_length=30,
+        choices=DataType.choices,
+        default=DataType.PLAIN,
+    )
+    data = models.JSONField(default=dict, blank=True)
+
+    status = models.CharField(
+        max_length=30,
+        choices=Status.choices,
+        default=Status.WILL_START,
+    )
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-id"]
+        indexes = [
+            models.Index(fields=["owner", "status", "data_type", "is_active"]),
+            models.Index(fields=["owner", "job", "project"]),
+        ]
+
+    def __str__(self):
+        return self.label
+
+
+class DocumentCategory(OwnedModel):
+    name = models.CharField(max_length=180)
+    parent = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="children",
+    )
+    description = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+        unique_together = [["owner", "parent", "name"]]
+        indexes = [
+            models.Index(fields=["owner", "is_active"]),
+            models.Index(fields=["owner", "parent"]),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class Document(OwnedModel):
+    name = models.CharField(max_length=180)
+    description = models.TextField(blank=True)
+
+    category = models.ForeignKey(
+        DocumentCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="documents",
+    )
+
+    job = models.ForeignKey(
+        Job,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="documents",
+    )
+    freelance_source = models.ForeignKey(
+        FreelanceSource,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="documents",
+    )
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="documents",
+    )
+
+    document_file = models.FileField(
+        upload_to=document_upload_path,
+        null=True,
+        blank=True,
+    )
+
+    external_url = models.URLField(blank=True)
+
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-id"]
+        indexes = [
+            models.Index(fields=["owner", "category", "is_active"]),
+            models.Index(fields=["owner", "job", "project"]),
+        ]
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def document_path(self):
+        if self.document_file:
+            return self.document_file.name
+        return ""
+
+    @property
+    def document_url(self):
+        if self.document_file:
+            try:
+                return self.document_file.url
+            except ValueError:
+                return ""
+        return self.external_url or ""
+    
+
