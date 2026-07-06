@@ -8,18 +8,38 @@ User = get_user_model()
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ["id", "email", "full_name", "first_name", "last_name", "phone", "profile_photo"]
+        fields = ["id", "username", "email", "full_name", "first_name", "last_name", "phone", "profile_photo"]
         read_only_fields = ["id", "email"]
+
+    def validate_username(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Username cannot be blank.")
+        qs = User.objects.filter(username__iexact=value)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("This username is already taken.")
+        return value
 
 
 class RegisterSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(required=False, allow_blank=True)
     password = serializers.CharField(write_only=True, validators=[validate_password])
     confirm_password = serializers.CharField(write_only=True)
 
     class Meta:
         model = User
-        fields = ["id", "full_name", "email", "phone", "password", "confirm_password"]
+        fields = ["id", "username", "full_name", "email", "phone", "password", "confirm_password"]
         read_only_fields = ["id"]
+
+    def validate_username(self, value):
+        value = (value or "").strip()
+        if not value:
+            return value
+        if User.objects.filter(username__iexact=value).exists():
+            raise serializers.ValidationError("This username is already taken.")
+        return value
 
     def validate(self, attrs):
         if attrs["password"] != attrs.pop("confirm_password"):
@@ -28,6 +48,9 @@ class RegisterSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         password = validated_data.pop("password")
+        username = (validated_data.get("username") or "").strip()
+        if not username:
+            validated_data.pop("username", None)
         return User.objects.create_user(password=password, **validated_data)
 
 

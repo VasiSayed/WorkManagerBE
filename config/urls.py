@@ -19,6 +19,7 @@ urlpatterns = [
     path("api/health/", HealthCheckAPIView.as_view()),
     path("api/auth/", include("accounts.urls")),
     path("api/", include("workmanager.urls")),
+    path("api/social/", include("connections.urls")),
 ]
 
 if settings.DEBUG:
