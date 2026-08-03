@@ -20,13 +20,13 @@ DEBUG = config("DEBUG", default=False, cast=bool)
 
 ALLOWED_HOSTS = config(
     "ALLOWED_HOSTS",
-    default="127.0.0.1,localhost,work-manager-fe-w2u7.vercel.app",
+    default="127.0.0.1,localhost",
     cast=Csv(),
 )
 
 FRONTEND_ORIGINS = config(
     "FRONTEND_ORIGINS",
-    default="http://localhost:5173,http://127.0.0.1:5173,https://work-manager-fe-w2u7.vercel.app",
+    default="http://localhost:5173,http://127.0.0.1:5173,https://work-manager-vasi-sayed.vercel.app",
     cast=Csv(),
 )
 
