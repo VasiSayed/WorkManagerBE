@@ -1,4 +1,8 @@
+from django.contrib.auth import get_user_model
+from django.db.models import Q
 from rest_framework import serializers
+
+from connections.models import ConnectionInvitation
 
 from .email_utils import extract_variables, render_template_text
 from .models import (
@@ -21,7 +25,7 @@ from .models import (
     SalaryRule,
     Task,
     WorkMember,
-    Note,Document,DocumentCategory
+    Note, NoteFolder, NoteShare, Document, DocumentCategory, DocumentFile
 )
 
 
@@ -32,6 +36,17 @@ class OwnerPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
         if request and request.user and request.user.is_authenticated and hasattr(base_queryset.model, "owner"):
             return base_queryset.filter(owner=request.user)
         return base_queryset.none()
+
+
+class MultipleFileField(serializers.ListField):
+    """Accept repeated multipart keys as well as DRF's indexed list syntax."""
+
+    def get_value(self, dictionary):
+        if hasattr(dictionary, "getlist"):
+            values = dictionary.getlist(self.field_name)
+            if values:
+                return values
+        return super().get_value(dictionary)
 
 
 
@@ -593,161 +608,334 @@ class AttachmentSerializer(serializers.ModelSerializer):
 
 
 
-from rest_framework import serializers
+User = get_user_model()
 
 
-class NoteSerializer(serializers.ModelSerializer):
-    job = OwnerPrimaryKeyRelatedField(
-        queryset=Job.objects.all(),
-        required=False,
-        allow_null=True,
-    )
-    freelance_source = OwnerPrimaryKeyRelatedField(
-        queryset=FreelanceSource.objects.all(),
-        required=False,
-        allow_null=True,
-    )
-    project = OwnerPrimaryKeyRelatedField(
-        queryset=Project.objects.all(),
-        required=False,
-        allow_null=True,
-    )
-    members = OwnerPrimaryKeyRelatedField(
-        queryset=WorkMember.objects.all(),
-        many=True,
-        required=False,
-    )
-
-    job_name = serializers.CharField(source="job.company_name", read_only=True)
-    freelance_source_name = serializers.CharField(source="freelance_source.name", read_only=True)
-    project_name = serializers.CharField(source="project.name", read_only=True)
-
-    class Meta:
-        model = Note
-        fields = [
-            "id",
-            "label",
-            "description",
-            "job",
-            "job_name",
-            "freelance_source",
-            "freelance_source_name",
-            "project",
-            "project_name",
-            "members",
-            "data_type",
-            "data",
-            "status",
-            "is_active",
-            "created_at",
-            "updated_at",
-        ]
-        read_only_fields = [
-            "id",
-            "job_name",
-            "freelance_source_name",
-            "project_name",
-            "created_at",
-            "updated_at",
-        ]
-
-    def validate(self, attrs):
-        data_type = attrs.get("data_type", getattr(self.instance, "data_type", None))
-        data = attrs.get("data", getattr(self.instance, "data", None))
-
-        if data in ("", None):
-            attrs["data"] = {}
-
-        if data_type == Note.DataType.PLAIN and data and not isinstance(data, (dict, str)):
-            raise serializers.ValidationError({
-                "data": "For plain note, data should be object or string."
-            })
-
-        if data_type in [Note.DataType.POINTS, Note.DataType.CHECKLIST] and data and not isinstance(data, list):
-            raise serializers.ValidationError({
-                "data": "For points/checklist note, data should be a list."
-            })
-
-        if data_type == Note.DataType.TABLE and data and not isinstance(data, dict):
-            raise serializers.ValidationError({
-                "data": "For table note, data should be an object with columns and rows."
-            })
-
-        return attrs
-
-    def create(self, validated_data):
-        members = validated_data.pop("members", [])
-        note = Note.objects.create(**validated_data)
-        if members:
-            note.members.set(members)
-        return note
-
-    def update(self, instance, validated_data):
-        members = validated_data.pop("members", None)
-        instance = super().update(instance, validated_data)
-        if members is not None:
-            instance.members.set(members)
-        return instance
+def connected_user_ids(user):
+    if not user or not user.is_authenticated:
+        return set()
+    pairs = ConnectionInvitation.objects.filter(
+        Q(sender=user) | Q(recipient=user),
+        status=ConnectionInvitation.Status.ACCEPTED,
+    ).values_list("sender_id", "recipient_id")
+    ids = set()
+    for sender_id, recipient_id in pairs:
+        ids.add(recipient_id if sender_id == user.id else sender_id)
+    return ids
 
 
-class DocumentCategorySerializer(serializers.ModelSerializer):
+class NoteFolderSerializer(serializers.ModelSerializer):
     parent = OwnerPrimaryKeyRelatedField(
-        queryset=DocumentCategory.objects.all(),
+        queryset=NoteFolder.objects.all(),
         required=False,
         allow_null=True,
     )
-    parent_name = serializers.CharField(source="parent.name", read_only=True)
+    parent_name = serializers.CharField(
+        source="parent.name",
+        read_only=True,
+    )
+    icon_url = serializers.SerializerMethodField()
+    notes_count = serializers.IntegerField(
+        read_only=True,
+        default=0,
+    )
+
+    # New folders are active by default.
+    is_active = serializers.BooleanField(
+        required=False,
+        default=True,
+    )
 
     class Meta:
-        model = DocumentCategory
+        model = NoteFolder
         fields = [
             "id",
             "name",
             "parent",
             "parent_name",
             "description",
+            "icon_image",
+            "icon_url",
             "is_active",
+            "notes_count",
             "created_at",
             "updated_at",
         ]
         read_only_fields = [
             "id",
             "parent_name",
+            "icon_url",
+            "notes_count",
             "created_at",
             "updated_at",
         ]
 
+    def get_icon_url(self, obj):
+        if not obj.icon_image:
+            return ""
+
+        request = self.context.get("request")
+
+        try:
+            url = obj.icon_image.url
+            return request.build_absolute_uri(url) if request else url
+        except ValueError:
+            return ""
+
     def validate(self, attrs):
-        parent = attrs.get("parent", getattr(self.instance, "parent", None))
+        parent = attrs.get(
+            "parent",
+            getattr(self.instance, "parent", None),
+        )
 
         if self.instance and parent and parent.id == self.instance.id:
             raise serializers.ValidationError({
-                "parent": "Category cannot be parent of itself."
+                "parent": "Folder cannot be parent of itself."
             })
+
+        cursor = parent
+
+        while cursor:
+            if self.instance and cursor.id == self.instance.id:
+                raise serializers.ValidationError({
+                    "parent": "Circular folder hierarchy is not allowed."
+                })
+
+            cursor = cursor.parent
 
         return attrs
 
+    def create(self, validated_data):
+        # Explicitly ensure all newly created folders are active.
+        validated_data["is_active"] = True
+        return super().create(validated_data)
+    
+
+class NoteSharedUserSerializer(serializers.ModelSerializer):
+    display_name = serializers.SerializerMethodField()
+    permission = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = ["id", "email", "full_name", "display_name", "profile_photo", "permission"]
+
+    def get_display_name(self, obj):
+        return obj.full_name or obj.email
+
+    def get_permission(self, obj):
+        note = self.context.get("note")
+        if not note:
+            return NoteShare.Permission.VIEW
+        share = next((x for x in note.shares.all() if x.user_id == obj.id), None)
+        return share.permission if share else NoteShare.Permission.VIEW
+
+
+class NoteSerializer(serializers.ModelSerializer):
+    job = OwnerPrimaryKeyRelatedField(queryset=Job.objects.all(), required=False, allow_null=True)
+    freelance_source = OwnerPrimaryKeyRelatedField(queryset=FreelanceSource.objects.all(), required=False, allow_null=True)
+    project = OwnerPrimaryKeyRelatedField(queryset=Project.objects.all(), required=False, allow_null=True)
+    members = OwnerPrimaryKeyRelatedField(queryset=WorkMember.objects.all(), many=True, required=False)
+    folder = OwnerPrimaryKeyRelatedField(queryset=NoteFolder.objects.all(), required=False, allow_null=True)
+    shared_with = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        write_only=True,
+    )
+    share_permission = serializers.ChoiceField(
+        choices=NoteShare.Permission.choices,
+        default=NoteShare.Permission.EDIT,
+        required=False,
+        write_only=True,
+    )
+
+    job_name = serializers.CharField(source="job.company_name", read_only=True)
+    freelance_source_name = serializers.CharField(source="freelance_source.name", read_only=True)
+    project_name = serializers.CharField(source="project.name", read_only=True)
+    folder_name = serializers.CharField(source="folder.name", read_only=True)
+    shared_users = serializers.SerializerMethodField()
+    is_owner = serializers.SerializerMethodField()
+    can_edit = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Note
+        fields = [
+            "id", "label", "description", "folder", "folder_name",
+            "visibility", "shared_with", "share_permission", "shared_users",
+            "is_owner", "can_edit",
+            "job", "job_name", "freelance_source", "freelance_source_name",
+            "project", "project_name", "members", "data_type", "data",
+            "status", "is_active", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "job_name", "freelance_source_name", "project_name",
+            "folder_name", "shared_users", "is_owner", "can_edit",
+            "created_at", "updated_at",
+        ]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        request = self.context.get("request")
+        if (
+            getattr(self.instance, "owner_id", None)
+            and request
+            and request.user.is_authenticated
+            and getattr(self.instance, "owner_id", None) != request.user.id
+        ):
+            # A connected collaborator may update the note content/status only.
+            # Ownership, folder placement, source links and sharing remain owner-controlled.
+            for field_name in [
+                "folder", "visibility", "shared_with", "share_permission",
+                "job", "freelance_source", "project", "members", "is_active",
+            ]:
+                if field_name in fields:
+                    fields[field_name].read_only = True
+                    fields[field_name].required = False
+        return fields
+
+    def get_shared_users(self, obj):
+        users = [share.user for share in obj.shares.all()]
+        return NoteSharedUserSerializer(users, many=True, context={**self.context, "note": obj}).data
+
+    def get_is_owner(self, obj):
+        request = self.context.get("request")
+        return bool(request and request.user.is_authenticated and obj.owner_id == request.user.id)
+
+    def get_can_edit(self, obj):
+        request = self.context.get("request")
+        if not request or not request.user.is_authenticated:
+            return False
+        if obj.owner_id == request.user.id:
+            return True
+        return any(share.user_id == request.user.id and share.permission == NoteShare.Permission.EDIT for share in obj.shares.all())
+
+    def validate(self, attrs):
+        data_type = attrs.get("data_type", getattr(self.instance, "data_type", Note.DataType.PLAIN))
+        data = attrs.get("data", getattr(self.instance, "data", None))
+        request = self.context.get("request")
+
+        if data in ("", None):
+            attrs["data"] = {} if data_type not in [Note.DataType.POINTS, Note.DataType.CHECKLIST] else []
+            data = attrs["data"]
+
+        if data_type == Note.DataType.PLAIN and data and not isinstance(data, (dict, str)):
+            raise serializers.ValidationError({"data": "For plain note, data should be object or string."})
+        if data_type in [Note.DataType.POINTS, Note.DataType.CHECKLIST] and data and not isinstance(data, list):
+            raise serializers.ValidationError({"data": "For points/checklist note, data should be a list."})
+        if data_type == Note.DataType.TABLE and data and not isinstance(data, dict):
+            raise serializers.ValidationError({"data": "For table note, data should be an object with columns and rows."})
+
+        shared_ids = attrs.get("shared_with")
+        if shared_ids is not None and request:
+            shared_ids = list(dict.fromkeys(int(x) for x in shared_ids if int(x) != request.user.id))
+            allowed = connected_user_ids(request.user)
+            invalid = [user_id for user_id in shared_ids if user_id not in allowed]
+            if invalid:
+                raise serializers.ValidationError({
+                    "shared_with": "Notes can only be shared with users whose invitation has been accepted."
+                })
+            found = set(User.objects.filter(id__in=shared_ids, is_active=True).values_list("id", flat=True))
+            if found != set(shared_ids):
+                raise serializers.ValidationError({"shared_with": "One or more selected users are invalid."})
+            attrs["shared_with"] = shared_ids
+
+        return attrs
+
+    def _save_shares(self, note, user_ids, permission):
+        if user_ids is None:
+            return
+        wanted = set(user_ids)
+        note.shares.exclude(user_id__in=wanted).delete()
+        existing = {share.user_id: share for share in note.shares.all()}
+        request = self.context.get("request")
+        for user_id in wanted:
+            share = existing.get(user_id)
+            if share:
+                if share.permission != permission:
+                    share.permission = permission
+                    share.save(update_fields=["permission", "updated_at"])
+            else:
+                NoteShare.objects.create(
+                    note=note, user_id=user_id, permission=permission,
+                    invited_by=request.user if request else note.owner,
+                )
+        note.visibility = Note.Visibility.SHARED if wanted else Note.Visibility.PERSONAL
+        note.save(update_fields=["visibility", "updated_at"])
+
+    def create(self, validated_data):
+        members = validated_data.pop("members", [])
+        shared_ids = validated_data.pop("shared_with", [])
+        permission = validated_data.pop("share_permission", NoteShare.Permission.EDIT)
+        note = Note.objects.create(**validated_data)
+        if members:
+            note.members.set(members)
+        self._save_shares(note, shared_ids, permission)
+        return note
+
+    def update(self, instance, validated_data):
+        members = validated_data.pop("members", None)
+        shared_ids = validated_data.pop("shared_with", None)
+        permission = validated_data.pop("share_permission", NoteShare.Permission.EDIT)
+        instance = super().update(instance, validated_data)
+        if members is not None:
+            instance.members.set(members)
+        self._save_shares(instance, shared_ids, permission)
+        return instance
+
+
+class DocumentCategorySerializer(serializers.ModelSerializer):
+    parent = OwnerPrimaryKeyRelatedField(queryset=DocumentCategory.objects.all(), required=False, allow_null=True)
+    parent_name = serializers.CharField(source="parent.name", read_only=True)
+    icon_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DocumentCategory
+        fields = [
+            "id", "name", "parent", "parent_name", "description",
+            "icon_image", "icon_url", "is_active", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "parent_name", "icon_url", "created_at", "updated_at"]
+
+    def get_icon_url(self, obj):
+        if not obj.icon_image:
+            return ""
+        request = self.context.get("request")
+        try:
+            url = obj.icon_image.url
+            return request.build_absolute_uri(url) if request else url
+        except ValueError:
+            return ""
+
+    def validate(self, attrs):
+        parent = attrs.get("parent", getattr(self.instance, "parent", None))
+        if self.instance and parent and parent.id == self.instance.id:
+            raise serializers.ValidationError({"parent": "Category cannot be parent of itself."})
+        cursor = parent
+        while cursor:
+            if self.instance and cursor.id == self.instance.id:
+                raise serializers.ValidationError({"parent": "Circular category hierarchy is not allowed."})
+            cursor = cursor.parent
+        return attrs
+
+
+class DocumentFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = DocumentFile
+        fields = ["id", "file", "file_url", "original_name", "created_at"]
+        read_only_fields = fields
+
 
 class DocumentSerializer(serializers.ModelSerializer):
-    category = OwnerPrimaryKeyRelatedField(
-        queryset=DocumentCategory.objects.all(),
+    category = OwnerPrimaryKeyRelatedField(queryset=DocumentCategory.objects.all(), required=False, allow_null=True)
+    job = OwnerPrimaryKeyRelatedField(queryset=Job.objects.all(), required=False, allow_null=True)
+    freelance_source = OwnerPrimaryKeyRelatedField(queryset=FreelanceSource.objects.all(), required=False, allow_null=True)
+    project = OwnerPrimaryKeyRelatedField(queryset=Project.objects.all(), required=False, allow_null=True)
+    uploaded_files = MultipleFileField(
+        child=serializers.FileField(),
         required=False,
-        allow_null=True,
-    )
-    job = OwnerPrimaryKeyRelatedField(
-        queryset=Job.objects.all(),
-        required=False,
-        allow_null=True,
-    )
-    freelance_source = OwnerPrimaryKeyRelatedField(
-        queryset=FreelanceSource.objects.all(),
-        required=False,
-        allow_null=True,
-    )
-    project = OwnerPrimaryKeyRelatedField(
-        queryset=Project.objects.all(),
-        required=False,
-        allow_null=True,
+        write_only=True,
+        allow_empty=True,
     )
 
     category_name = serializers.CharField(source="category.name", read_only=True)
@@ -756,50 +944,53 @@ class DocumentSerializer(serializers.ModelSerializer):
     project_name = serializers.CharField(source="project.name", read_only=True)
     document_url = serializers.CharField(read_only=True)
     document_path = serializers.CharField(read_only=True)
+    files = DocumentFileSerializer(many=True, read_only=True)
 
     class Meta:
         model = Document
         fields = [
-            "id",
-            "name",
-            "description",
-            "category",
-            "category_name",
-            "job",
-            "job_name",
-            "freelance_source",
-            "freelance_source_name",
-            "project",
-            "project_name",
-            "document_file",
-            "document_path",
-            "document_url",
-            "external_url",
-            "is_active",
-            "created_at",
-            "updated_at",
+            "id", "name", "description", "category", "category_name",
+            "job", "job_name", "freelance_source", "freelance_source_name",
+            "project", "project_name", "document_file", "document_path",
+            "document_url", "external_url", "uploaded_files", "files",
+            "is_active", "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id",
-            "category_name",
-            "job_name",
-            "freelance_source_name",
-            "project_name",
-            "document_path",
-            "document_url",
-            "created_at",
-            "updated_at",
+            "id", "category_name", "job_name", "freelance_source_name",
+            "project_name", "document_path", "document_url", "files",
+            "created_at", "updated_at",
         ]
 
     def validate(self, attrs):
         document_file = attrs.get("document_file", getattr(self.instance, "document_file", None))
         external_url = attrs.get("external_url", getattr(self.instance, "external_url", ""))
-
-        if not document_file and not external_url:
+        uploaded_files = attrs.get("uploaded_files", [])
+        existing_extra = bool(self.instance and self.instance.files.exists())
+        if not document_file and not external_url and not uploaded_files and not existing_extra:
             raise serializers.ValidationError({
-                "document_file": "Upload document file or provide external_url."
+                "document_file": "Upload one or more files or provide external_url."
             })
-
         return attrs
-    
-    
+
+    def _save_extra_files(self, document, uploaded_files):
+        request = self.context.get("request")
+        for upload in uploaded_files or []:
+            DocumentFile.objects.create(
+                document=document,
+                file=upload,
+                original_name=getattr(upload, "name", ""),
+                uploaded_by=request.user if request else document.owner,
+            )
+
+    def create(self, validated_data):
+        uploaded_files = validated_data.pop("uploaded_files", [])
+        document = Document.objects.create(**validated_data)
+        self._save_extra_files(document, uploaded_files)
+        return document
+
+    def update(self, instance, validated_data):
+        uploaded_files = validated_data.pop("uploaded_files", [])
+        instance = super().update(instance, validated_data)
+        self._save_extra_files(instance, uploaded_files)
+        return instance
+

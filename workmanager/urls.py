@@ -30,6 +30,7 @@ from .views import (
     TaskViewSet,
     WorkMemberViewSet,
     NoteViewSet,
+    NoteFolderViewSet,
     DocumentCategoryViewSet,
     DocumentViewSet
 )
@@ -43,6 +44,7 @@ router.register(r"leave", LeaveRecordViewSet, basename="leave")
 router.register(r"salary", SalaryRecordViewSet, basename="salary")
 router.register(r"emails", EmailLogViewSet, basename="emails")
 router.register(r"notes", NoteViewSet, basename="notes")
+router.register(r"note-folders", NoteFolderViewSet, basename="note-folders")
 router.register(r"document-categories", DocumentCategoryViewSet, basename="document-categories")
 router.register(r"documents", DocumentViewSet, basename="documents")
 

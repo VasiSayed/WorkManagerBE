@@ -11,9 +11,11 @@ from django.utils import timezone
 from rest_framework import decorators, permissions, response, status, viewsets
 from rest_framework.views import APIView
 
+from connections.models import ConnectionInvitation, Notification
+
 from .email_utils import render_template_text
 from .models import (
-        Note,Document,DocumentCategory,
+        Note, NoteFolder, NoteShare, Document, DocumentCategory, DocumentFile,
     Attachment,
     DesignationHistory,
     EmailLog,
@@ -37,7 +39,7 @@ from .serializers import (
     DesignationHistorySerializer,
     EmailLogSerializer,
     EmailTemplateSerializer,
-    NoteSerializer,DocumentCategorySerializer,DocumentSerializer,
+    NoteSerializer, NoteFolderSerializer, DocumentCategorySerializer, DocumentSerializer,
     EmailVariableSerializer,
     EmailTypeSerializer,
     FreelanceSourceSerializer,
@@ -1302,53 +1304,217 @@ class OptionsAPIView(APIView):
         })
 
 
-class NoteViewSet(OwnedModelViewSet):
-    queryset = Note.objects.select_related(
-        "job",
-        "freelance_source",
-        "project",
-    ).prefetch_related("members")
-    serializer_class = NoteSerializer
-    search_fields = [
-        "label",
-        "description",
-        "job__company_name",
-        "freelance_source__name",
-        "project__name",
-    ]
-    ordering_fields = [
-        "label",
-        "status",
-        "data_type",
-        "created_at",
-        "updated_at",
-    ]
+class NoteFolderViewSet(OwnedModelViewSet):
+    queryset = NoteFolder.objects.select_related("parent").annotate(notes_count=Count("notes"))
+    serializer_class = NoteFolderSerializer
+    search_fields = ["name", "description", "parent__name"]
+    ordering_fields = ["name", "created_at", "updated_at"]
 
     def apply_common_filters(self, queryset):
         queryset = super().apply_common_filters(queryset)
         params = self.request.query_params
-
-        if params.get("status"):
-            queryset = queryset.filter(status=params["status"])
-
-        if params.get("data_type"):
-            queryset = queryset.filter(data_type=params["data_type"])
-
         if params.get("is_active") in ["true", "false"]:
             queryset = queryset.filter(is_active=params["is_active"] == "true")
+        if params.get("parent"):
+            queryset = queryset.filter(parent_id=params["parent"])
+        if params.get("root") in ["true", "1"]:
+            queryset = queryset.filter(parent__isnull=True)
+        return queryset
 
+
+def _notification_text_user(user):
+    return getattr(user, "full_name", "") or user.email
+
+
+def _notify_note_users(note, actor, type_value, title, message, exclude_ids=None):
+    exclude_ids = set(exclude_ids or []) | {actor.id}
+    recipients = {share.user_id: share.user for share in note.shares.select_related("user").all()}
+    if note.owner_id not in exclude_ids:
+        recipients[note.owner_id] = note.owner
+    for user_id, user in recipients.items():
+        if user_id in exclude_ids:
+            continue
+        Notification.objects.create(
+            recipient=user, actor=actor, type=type_value, title=title,
+            message=message, payload={"note_id": note.id, "path": f"/notes/{note.id}"},
+        )
+
+
+class NoteViewSet(OwnedModelViewSet):
+    queryset = Note.objects.select_related(
+        "owner", "folder", "job", "freelance_source", "project",
+    ).prefetch_related("members", "shares__user")
+    serializer_class = NoteSerializer
+    search_fields = [
+        "label", "description", "folder__name", "job__company_name",
+        "freelance_source__name", "project__name",
+    ]
+    ordering_fields = ["label", "status", "data_type", "created_at", "updated_at"]
+
+    def get_queryset(self):
+        queryset = self.queryset.filter(
+            Q(owner=self.request.user) | Q(shares__user=self.request.user)
+        ).distinct()
+        return self.apply_common_filters(queryset)
+
+    def _share_permission(self, note):
+        if note.owner_id == self.request.user.id:
+            return NoteShare.Permission.EDIT
+        share = next((x for x in note.shares.all() if x.user_id == self.request.user.id), None)
+        return share.permission if share else None
+
+    def _require_edit(self, note):
+        if self._share_permission(note) != NoteShare.Permission.EDIT:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You only have view access to this note.")
+
+    def perform_create(self, serializer):
+        note = serializer.save(owner=self.request.user)
+        for share in note.shares.select_related("user").all():
+            Notification.objects.create(
+                recipient=share.user, actor=self.request.user,
+                type=Notification.Type.NOTE_SHARED, title="Note shared with you",
+                message=f"{_notification_text_user(self.request.user)} shared '{note.label}' with you.",
+                payload={"note_id": note.id, "path": f"/notes/{note.id}"},
+            )
+
+    def perform_update(self, serializer):
+        note = serializer.instance
+        self._require_edit(note)
+        before = set(note.shares.values_list("user_id", flat=True))
+        updated = serializer.save()
+        after = set(updated.shares.values_list("user_id", flat=True))
+        for share in updated.shares.select_related("user").filter(user_id__in=after - before):
+            Notification.objects.create(
+                recipient=share.user, actor=self.request.user,
+                type=Notification.Type.NOTE_SHARED, title="Note shared with you",
+                message=f"{_notification_text_user(self.request.user)} shared '{updated.label}' with you.",
+                payload={"note_id": updated.id, "path": f"/notes/{updated.id}"},
+            )
+        _notify_note_users(
+            updated, self.request.user, Notification.Type.NOTE_UPDATED,
+            "Shared note updated",
+            f"{_notification_text_user(self.request.user)} updated '{updated.label}'.",
+            exclude_ids=after - before,
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        note = self.get_object()
+        if note.owner_id != request.user.id:
+            return response.Response(
+                {"detail": "Only the note owner can delete this note."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return super().destroy(request, *args, **kwargs)
+
+    @decorators.action(detail=False, methods=["get"], url_path="shareable-users")
+    def shareable_users(self, request):
+        invitations = ConnectionInvitation.objects.filter(
+            Q(sender=request.user) | Q(recipient=request.user),
+            status=ConnectionInvitation.Status.ACCEPTED,
+        ).select_related("sender", "recipient")
+        users = []
+        seen = set()
+        for invitation in invitations:
+            user = invitation.recipient if invitation.sender_id == request.user.id else invitation.sender
+            if user.id in seen:
+                continue
+            seen.add(user.id)
+            users.append({
+                "id": user.id, "email": user.email,
+                "full_name": user.full_name,
+                "display_name": user.full_name or user.email,
+                "profile_photo": user.profile_photo.url if user.profile_photo else "",
+            })
+        return response.Response(users)
+
+    @decorators.action(detail=True, methods=["post"], url_path="move")
+    def move(self, request, pk=None):
+        note = self.get_object()
+        if note.owner_id != request.user.id:
+            return response.Response(
+                {"detail": "Only the note owner can move it between folders."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        folder_id = request.data.get("folder")
+        folder = None
+        if folder_id not in [None, "", "null"]:
+            folder = NoteFolder.objects.filter(owner=request.user, id=folder_id).first()
+            if not folder:
+                return response.Response({"folder": "Invalid note folder."}, status=status.HTTP_400_BAD_REQUEST)
+        note.folder = folder
+        note.save(update_fields=["folder", "updated_at"])
+        return response.Response(self.get_serializer(note).data)
+
+    @decorators.action(
+        detail=True, methods=["post"],
+        url_path=r"checklist-items/(?P<item_index>\d+)/toggle",
+    )
+    def toggle_checklist_item(self, request, pk=None, item_index=None):
+        note = self.get_object()
+        self._require_edit(note)
+        if note.data_type != Note.DataType.CHECKLIST or not isinstance(note.data, list):
+            return response.Response(
+                {"detail": "This note is not a checklist note."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        index = int(item_index)
+        if index < 0 or index >= len(note.data):
+            return response.Response({"detail": "Checklist item not found."}, status=status.HTTP_404_NOT_FOUND)
+        rows = [dict(item) if isinstance(item, dict) else {"name": str(item)} for item in note.data]
+        current = bool(rows[index].get("done"))
+        done_value = request.data.get("done", not current)
+        if isinstance(done_value, str):
+            done_value = done_value.lower() in ["true", "1", "yes", "on"]
+        rows[index]["done"] = bool(done_value)
+        if done_value:
+            rows[index]["status"] = Note.Status.COMPLETED
+        elif rows[index].get("status") == Note.Status.COMPLETED:
+            rows[index]["status"] = Note.Status.STARTED
+        note.data = rows
+        total = len(rows)
+        completed = sum(1 for item in rows if item.get("done"))
+        if total and completed == total:
+            note.status = Note.Status.COMPLETED
+        elif completed:
+            note.status = Note.Status.PARTIAL_DONE
+        elif note.status == Note.Status.COMPLETED:
+            note.status = Note.Status.STARTED
+        note.save(update_fields=["data", "status", "updated_at"])
+        _notify_note_users(
+            note, request.user, Notification.Type.NOTE_CHECKLIST_UPDATED,
+            "Checklist updated",
+            f"{_notification_text_user(request.user)} marked a checklist item {'done' if done_value else 'not done'} in '{note.label}'.",
+        )
+        return response.Response(self.get_serializer(note).data)
+
+    def apply_common_filters(self, queryset):
+        queryset = super().apply_common_filters(queryset)
+        params = self.request.query_params
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        if params.get("data_type"):
+            queryset = queryset.filter(data_type=params["data_type"])
+        if params.get("visibility"):
+            queryset = queryset.filter(visibility=params["visibility"])
+        if params.get("is_active") in ["true", "false"]:
+            queryset = queryset.filter(is_active=params["is_active"] == "true")
+        if params.get("folder"):
+            queryset = queryset.filter(folder_id=params["folder"])
+        if params.get("standalone") in ["true", "1"]:
+            queryset = queryset.filter(folder__isnull=True)
+        if params.get("owned") in ["true", "1"]:
+            queryset = queryset.filter(owner=self.request.user)
+        if params.get("shared") in ["true", "1"]:
+            queryset = queryset.filter(shares__user=self.request.user).exclude(owner=self.request.user)
         if params.get("job"):
             queryset = queryset.filter(job_id=params["job"])
-
         if params.get("freelance_source"):
             queryset = queryset.filter(freelance_source_id=params["freelance_source"])
-
         if params.get("project"):
             queryset = queryset.filter(project_id=params["project"])
-
         if params.get("member"):
             queryset = queryset.filter(members__id=params["member"])
-
         return queryset.distinct()
 
 
@@ -1384,11 +1550,8 @@ class DocumentCategoryViewSet(OwnedModelViewSet):
 
 class DocumentViewSet(OwnedModelViewSet):
     queryset = Document.objects.select_related(
-        "category",
-        "job",
-        "freelance_source",
-        "project",
-    )
+        "category", "job", "freelance_source", "project",
+    ).prefetch_related("files")
     serializer_class = DocumentSerializer
     search_fields = [
         "name",
@@ -1403,6 +1566,16 @@ class DocumentViewSet(OwnedModelViewSet):
         "created_at",
         "updated_at",
     ]
+
+    @decorators.action(detail=True, methods=["delete"], url_path=r"files/(?P<file_id>\d+)")
+    def delete_file(self, request, pk=None, file_id=None):
+        document = self.get_object()
+        file_record = DocumentFile.objects.filter(document=document, id=file_id).first()
+        if not file_record:
+            return response.Response({"detail": "File not found."}, status=status.HTTP_404_NOT_FOUND)
+        file_record.file.delete(save=False)
+        file_record.delete()
+        return response.Response(status=status.HTTP_204_NO_CONTENT)
 
     def apply_common_filters(self, queryset):
         queryset = super().apply_common_filters(queryset)

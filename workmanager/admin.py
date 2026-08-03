@@ -20,6 +20,12 @@ from .models import (
     SalaryRule,
     Task,
     WorkMember,
+    Note,
+    NoteFolder,
+    NoteShare,
+    DocumentCategory,
+    Document,
+    DocumentFile,
 )
 
 
@@ -114,3 +120,44 @@ class EmailVariableAdmin(OwnerAdmin):
 admin.site.register(EmailTemplate, OwnerAdmin)
 admin.site.register(SMTPConfig, OwnerAdmin)
 admin.site.register(Attachment, OwnerAdmin)
+
+
+@admin.register(NoteFolder)
+class NoteFolderAdmin(OwnerAdmin):
+    list_display = ("name", "parent", "owner", "is_active", "updated_at")
+    list_filter = ("is_active",)
+    search_fields = ("name", "description")
+
+
+class NoteShareInline(admin.TabularInline):
+    model = NoteShare
+    extra = 0
+
+
+@admin.register(Note)
+class NoteAdmin(OwnerAdmin):
+    list_display = ("label", "folder", "visibility", "data_type", "status", "owner", "is_active")
+    list_filter = ("visibility", "data_type", "status", "is_active")
+    search_fields = ("label", "description", "folder__name")
+    inlines = [NoteShareInline]
+
+
+@admin.register(DocumentCategory)
+class DocumentCategoryAdmin(OwnerAdmin):
+    list_display = ("name", "parent", "owner", "is_active")
+    list_filter = ("is_active",)
+    search_fields = ("name", "description")
+
+
+class DocumentFileInline(admin.TabularInline):
+    model = DocumentFile
+    extra = 0
+    readonly_fields = ("created_at",)
+
+
+@admin.register(Document)
+class DocumentAdmin(OwnerAdmin):
+    list_display = ("name", "category", "owner", "is_active", "updated_at")
+    list_filter = ("is_active", "category")
+    search_fields = ("name", "description")
+    inlines = [DocumentFileInline]

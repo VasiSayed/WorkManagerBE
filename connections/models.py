@@ -31,6 +31,9 @@ class Notification(TimeStampedModel):
         GROUP_ADDED = "group_added", "Added To Group"
         BLOCKED = "blocked", "Blocked"
         REVIEW_RECEIVED = "review_received", "Review Received"
+        NOTE_SHARED = "note_shared", "Note Shared"
+        NOTE_UPDATED = "note_updated", "Shared Note Updated"
+        NOTE_CHECKLIST_UPDATED = "note_checklist_updated", "Note Checklist Updated"
 
     recipient = models.ForeignKey(User, on_delete=models.CASCADE, related_name="social_notifications")
     actor = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="social_notifications_sent")

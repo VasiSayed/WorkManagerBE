@@ -578,14 +578,55 @@ class Attachment(OwnedModel):
 
 
 
-from django.db import models
-from django.utils import timezone
-
-
 def document_upload_path(instance, filename):
     owner_id = instance.owner_id or "unknown"
     today = timezone.now().date()
     return f"documents/{owner_id}/{today:%Y/%m/%d}/{filename}"
+
+
+def document_extra_upload_path(instance, filename):
+    owner_id = instance.document.owner_id if instance.document_id else "unknown"
+    today = timezone.now().date()
+    return f"documents/{owner_id}/{today:%Y/%m/%d}/extra/{filename}"
+
+
+def note_folder_icon_upload_path(instance, filename):
+    owner_id = instance.owner_id or "unknown"
+    return f"note-folders/{owner_id}/icons/{filename}"
+
+
+def document_category_icon_upload_path(instance, filename):
+    owner_id = instance.owner_id or "unknown"
+    return f"document-categories/{owner_id}/icons/{filename}"
+
+
+class NoteFolder(OwnedModel):
+    name = models.CharField(max_length=180)
+    parent = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="children",
+    )
+    description = models.TextField(blank=True)
+    icon_image = models.ImageField(
+        upload_to=note_folder_icon_upload_path,
+        null=True,
+        blank=True,
+    )
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+        unique_together = [["owner", "parent", "name"]]
+        indexes = [
+            models.Index(fields=["owner", "is_active"], name="wm_nf_owner_act_idx"),
+            models.Index(fields=["owner", "parent"], name="wm_nf_owner_par_idx"),
+        ]
+
+    def __str__(self):
+        return self.name
 
 
 class Note(OwnedModel):
@@ -604,8 +645,31 @@ class Note(OwnedModel):
         COMPLETED = "completed", "Completed"
         CANCELLED = "cancelled", "Cancelled"
 
+    class Visibility(models.TextChoices):
+        PERSONAL = "personal", "Personal"
+        SHARED = "shared", "Shared"
+
     label = models.CharField(max_length=180)
     description = models.TextField(blank=True)
+    folder = models.ForeignKey(
+        NoteFolder,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="notes",
+    )
+    visibility = models.CharField(
+        max_length=20,
+        choices=Visibility.choices,
+        default=Visibility.PERSONAL,
+    )
+    shared_with = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        through="NoteShare",
+        through_fields=("note", "user"),
+        blank=True,
+        related_name="shared_notes",
+    )
 
     job = models.ForeignKey(
         Job,
@@ -654,10 +718,48 @@ class Note(OwnedModel):
         indexes = [
             models.Index(fields=["owner", "status", "data_type", "is_active"]),
             models.Index(fields=["owner", "job", "project"]),
+            models.Index(fields=["owner", "folder", "visibility"], name="wm_note_fold_vis_idx"),
         ]
 
     def __str__(self):
         return self.label
+
+
+class NoteShare(models.Model):
+    class Permission(models.TextChoices):
+        VIEW = "view", "Can View"
+        EDIT = "edit", "Can Edit"
+
+    note = models.ForeignKey(Note, on_delete=models.CASCADE, related_name="shares")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="note_share_records",
+    )
+    permission = models.CharField(
+        max_length=10,
+        choices=Permission.choices,
+        default=Permission.EDIT,
+    )
+    invited_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="note_shares_created",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["user__email"]
+        constraints = [
+            models.UniqueConstraint(fields=["note", "user"], name="unique_note_share_user"),
+        ]
+        indexes = [models.Index(fields=["user", "permission"], name="wm_ns_user_perm_idx")]
+
+    def __str__(self):
+        return f"{self.note_id} shared with {self.user_id}"
 
 
 class DocumentCategory(OwnedModel):
@@ -670,6 +772,11 @@ class DocumentCategory(OwnedModel):
         related_name="children",
     )
     description = models.TextField(blank=True)
+    icon_image = models.ImageField(
+        upload_to=document_category_icon_upload_path,
+        null=True,
+        blank=True,
+    )
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -752,5 +859,38 @@ class Document(OwnedModel):
             except ValueError:
                 return ""
         return self.external_url or ""
-    
+
+class DocumentFile(models.Model):
+    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="files")
+    file = models.FileField(upload_to=document_extra_upload_path)
+    original_name = models.CharField(max_length=255, blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="uploaded_document_files",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        indexes = [models.Index(fields=["document", "created_at"], name="wm_df_doc_create_idx")]
+
+    def save(self, *args, **kwargs):
+        if self.file and not self.original_name:
+            self.original_name = self.file.name.rsplit("/", 1)[-1]
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.original_name or self.file.name
+
+    @property
+    def file_url(self):
+        if not self.file:
+            return ""
+        try:
+            return self.file.url
+        except ValueError:
+            return ""
 
