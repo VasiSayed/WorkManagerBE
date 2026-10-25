@@ -32,7 +32,10 @@ from .views import (
     NoteViewSet,
     NoteFolderViewSet,
     DocumentCategoryViewSet,
-    DocumentViewSet
+    DocumentViewSet,
+    ExpenseCategoryViewSet,
+    ExpenseViewSet,
+    ExpenseRelatedUsersAPIView,
 )
 
 router = DefaultRouter()
@@ -47,6 +50,8 @@ router.register(r"notes", NoteViewSet, basename="notes")
 router.register(r"note-folders", NoteFolderViewSet, basename="note-folders")
 router.register(r"document-categories", DocumentCategoryViewSet, basename="document-categories")
 router.register(r"documents", DocumentViewSet, basename="documents")
+router.register(r"expense-categories", ExpenseCategoryViewSet, basename="expense-categories")
+router.register(r"expenses", ExpenseViewSet, basename="expenses")
 
 # Management pages
 router.register(r"management/jobs", JobViewSet, basename="management-jobs")
@@ -65,6 +70,7 @@ router.register(r"management/attachments", AttachmentViewSet, basename="manageme
 
 urlpatterns = [
     path("", include(router.urls)),
+    path("users/", ExpenseRelatedUsersAPIView.as_view(), name="expense-related-users"),
     path("options/", OptionsAPIView.as_view(), name="api-options"),
     path("dashboard/", DashboardAPIView.as_view(), name="dashboard"),
     path("reports/", ReportsHubAPIView.as_view(), name="reports-hub"),

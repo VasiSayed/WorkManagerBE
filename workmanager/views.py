@@ -16,6 +16,7 @@ from connections.models import ConnectionInvitation, Notification
 from .email_utils import render_template_text
 from .models import (
         Note, NoteFolder, NoteShare, Document, DocumentCategory, DocumentFile,
+    Expense, ExpenseCategory, ExpenseFile,
     Attachment,
     DesignationHistory,
     EmailLog,
@@ -40,6 +41,7 @@ from .serializers import (
     EmailLogSerializer,
     EmailTemplateSerializer,
     NoteSerializer, NoteFolderSerializer, DocumentCategorySerializer, DocumentSerializer,
+    ExpenseCategorySerializer, ExpenseSerializer, ExpenseRelatedUserSerializer,
     EmailVariableSerializer,
     EmailTypeSerializer,
     FreelanceSourceSerializer,
@@ -1586,6 +1588,8 @@ class DocumentViewSet(OwnedModelViewSet):
 
         if params.get("category"):
             queryset = queryset.filter(category_id=params["category"])
+        if params.get("standalone") in ["true", "1"]:
+            queryset = queryset.filter(category__isnull=True)
 
         if params.get("job"):
             queryset = queryset.filter(job_id=params["job"])
@@ -1597,5 +1601,80 @@ class DocumentViewSet(OwnedModelViewSet):
             queryset = queryset.filter(project_id=params["project"])
 
         return queryset
-    
-    
+
+class ExpenseCategoryViewSet(OwnedModelViewSet):
+    queryset = ExpenseCategory.objects.all()
+    serializer_class = ExpenseCategorySerializer
+    search_fields = ["name", "description"]
+    ordering_fields = ["name", "created_at", "updated_at"]
+
+    def apply_common_filters(self, queryset):
+        queryset = super().apply_common_filters(queryset)
+        value = self.request.query_params.get("is_active")
+        if value in ["true", "false"]:
+            queryset = queryset.filter(is_active=value == "true")
+        return queryset
+
+
+class ExpenseViewSet(OwnedModelViewSet):
+    queryset = Expense.objects.select_related("category", "related_user").prefetch_related("files")
+    serializer_class = ExpenseSerializer
+    search_fields = ["name", "category__name", "related_user__full_name", "related_user__email"]
+    ordering_fields = ["date", "amount", "created_at", "updated_at"]
+
+    def apply_common_filters(self, queryset):
+        queryset = super().apply_common_filters(queryset)
+        params = self.request.query_params
+        transaction_type = params.get("transaction_type")
+        if transaction_type:
+            queryset = queryset.filter(transaction_type=transaction_type)
+        if params.get("category"):
+            queryset = queryset.filter(category_id=params["category"])
+        if params.get("standalone") in ["true", "1"]:
+            queryset = queryset.filter(category__isnull=True)
+        if params.get("related_user"):
+            queryset = queryset.filter(related_user_id=params["related_user"])
+        if params.get("date_from"):
+            queryset = queryset.filter(date__gte=params["date_from"])
+        if params.get("date_to"):
+            queryset = queryset.filter(date__lte=params["date_to"])
+        return queryset
+
+    @decorators.action(detail=False, methods=["get"])
+    def summary(self, request):
+        queryset = self.get_queryset()
+        totals = queryset.values("transaction_type").annotate(total=Sum("amount"))
+        given = Decimal("0.00")
+        received = Decimal("0.00")
+        for row in totals:
+            if row["transaction_type"] == Expense.TransactionType.GIVEN:
+                given = money(row["total"])
+            elif row["transaction_type"] == Expense.TransactionType.RECEIVED:
+                received = money(row["total"])
+        return response.Response({
+            "given": str(given),
+            "received": str(received),
+            "net": str(money(received - given)),
+            "formula": "received - given",
+        })
+
+    @decorators.action(detail=True, methods=["delete"], url_path=r"files/(?P<file_id>\d+)")
+    def delete_file(self, request, pk=None, file_id=None):
+        expense = self.get_object()
+        file_record = ExpenseFile.objects.filter(expense=expense, id=file_id).first()
+        if not file_record:
+            return response.Response({"detail": "File not found."}, status=status.HTTP_404_NOT_FOUND)
+        file_record.file.delete(save=False)
+        file_record.delete()
+        return response.Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ExpenseRelatedUsersAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        User = request.user.__class__
+        # Deliberately simple: expose the User model list without project/job/category filtering.
+        users = User.objects.all().order_by("full_name", "email", "id")
+        return response.Response(ExpenseRelatedUserSerializer(users, many=True, context={"request": request}).data)
+

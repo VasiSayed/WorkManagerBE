@@ -26,6 +26,9 @@ from .models import (
     DocumentCategory,
     Document,
     DocumentFile,
+    ExpenseCategory,
+    Expense,
+    ExpenseFile,
 )
 
 
@@ -161,3 +164,24 @@ class DocumentAdmin(OwnerAdmin):
     list_filter = ("is_active", "category")
     search_fields = ("name", "description")
     inlines = [DocumentFileInline]
+
+@admin.register(ExpenseCategory)
+class ExpenseCategoryAdmin(OwnerAdmin):
+    list_display = ("name", "owner", "is_active", "updated_at")
+    list_filter = ("is_active",)
+    search_fields = ("name", "description")
+
+
+class ExpenseFileInline(admin.TabularInline):
+    model = ExpenseFile
+    extra = 0
+    readonly_fields = ("created_at",)
+
+
+@admin.register(Expense)
+class ExpenseAdmin(OwnerAdmin):
+    list_display = ("date", "transaction_type", "amount", "name", "category", "related_user", "owner")
+    list_filter = ("transaction_type", "category", "date")
+    search_fields = ("name", "category__name", "related_user__email", "related_user__full_name")
+    inlines = [ExpenseFileInline]
+

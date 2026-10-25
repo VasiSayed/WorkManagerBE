@@ -27,3 +27,7 @@ logs/
 # Django migrations cache
 */migrations/__pycache__/
 
+
+# Local DB backups and test uploads
+*.sqlite3.bak*
+test_media_pm/

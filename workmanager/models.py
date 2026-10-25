@@ -792,7 +792,7 @@ class DocumentCategory(OwnedModel):
 
 
 class Document(OwnedModel):
-    name = models.CharField(max_length=180)
+    name = models.CharField(max_length=180, blank=True, default="")
     description = models.TextField(blank=True)
 
     category = models.ForeignKey(
@@ -843,7 +843,7 @@ class Document(OwnedModel):
         ]
 
     def __str__(self):
-        return self.name
+        return self.name or f"Document #{self.pk}"
 
     @property
     def document_path(self):
@@ -893,4 +893,98 @@ class DocumentFile(models.Model):
             return self.file.url
         except ValueError:
             return ""
+
+
+def expense_upload_path(instance, filename):
+    owner_id = instance.expense.owner_id if instance.expense_id else "unknown"
+    today = timezone.now().date()
+    return f"expenses/{owner_id}/{today:%Y/%m/%d}/{filename}"
+
+
+class ExpenseCategory(OwnedModel):
+    name = models.CharField(max_length=120)
+    description = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(fields=["owner", "name"], name="unique_expense_category_owner_name"),
+        ]
+        indexes = [models.Index(fields=["owner", "is_active"], name="wm_exp_cat_owner_act_idx")]
+
+    def __str__(self):
+        return self.name
+
+
+class Expense(OwnedModel):
+    class TransactionType(models.TextChoices):
+        GIVEN = "given", "Given"
+        RECEIVED = "received", "Received"
+
+    transaction_type = models.CharField(max_length=12, choices=TransactionType.choices, default=TransactionType.GIVEN)
+    amount = models.DecimalField(max_digits=14, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))])
+    name = models.CharField(max_length=255, blank=True, default="")
+    date = models.DateField(default=timezone.localdate)
+    category = models.ForeignKey(
+        ExpenseCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="expenses",
+    )
+    related_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="related_expenses",
+    )
+
+    class Meta:
+        ordering = ["-date", "-id"]
+        indexes = [
+            models.Index(fields=["owner", "date"], name="wm_exp_owner_date_idx"),
+            models.Index(fields=["owner", "transaction_type"], name="wm_exp_owner_type_idx"),
+            models.Index(fields=["owner", "category"], name="wm_exp_owner_cat_idx"),
+        ]
+
+    def __str__(self):
+        label = self.name or self.get_transaction_type_display()
+        return f"{label} - {self.amount}"
+
+
+class ExpenseFile(models.Model):
+    expense = models.ForeignKey(Expense, on_delete=models.CASCADE, related_name="files")
+    file = models.FileField(upload_to=expense_upload_path)
+    original_name = models.CharField(max_length=255, blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="uploaded_expense_files",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        indexes = [models.Index(fields=["expense", "created_at"], name="wm_ef_exp_create_idx")]
+
+    def save(self, *args, **kwargs):
+        if self.file and not self.original_name:
+            self.original_name = self.file.name.rsplit("/", 1)[-1]
+        super().save(*args, **kwargs)
+
+    @property
+    def file_url(self):
+        if not self.file:
+            return ""
+        try:
+            return self.file.url
+        except ValueError:
+            return ""
+
+    def __str__(self):
+        return self.original_name or self.file.name
 

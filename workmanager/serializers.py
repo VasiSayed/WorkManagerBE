@@ -25,7 +25,8 @@ from .models import (
     SalaryRule,
     Task,
     WorkMember,
-    Note, NoteFolder, NoteShare, Document, DocumentCategory, DocumentFile
+    Note, NoteFolder, NoteShare, Document, DocumentCategory, DocumentFile,
+    Expense, ExpenseCategory, ExpenseFile,
 )
 
 
@@ -927,6 +928,7 @@ class DocumentFileSerializer(serializers.ModelSerializer):
 
 
 class DocumentSerializer(serializers.ModelSerializer):
+    name = serializers.CharField(required=False, allow_blank=True, default="")
     category = OwnerPrimaryKeyRelatedField(queryset=DocumentCategory.objects.all(), required=False, allow_null=True)
     job = OwnerPrimaryKeyRelatedField(queryset=Job.objects.all(), required=False, allow_null=True)
     freelance_source = OwnerPrimaryKeyRelatedField(queryset=FreelanceSource.objects.all(), required=False, allow_null=True)
@@ -961,6 +963,16 @@ class DocumentSerializer(serializers.ModelSerializer):
             "created_at", "updated_at",
         ]
 
+    def to_internal_value(self, data):
+        # Multipart forms submit an empty string when Standalone mode clears
+        # an existing category/source relation. Normalize those values to null.
+        if hasattr(data, "copy"):
+            data = data.copy()
+            for field in ("category", "job", "freelance_source", "project"):
+                if data.get(field) == "":
+                    data[field] = None
+        return super().to_internal_value(data)
+
     def validate(self, attrs):
         document_file = attrs.get("document_file", getattr(self.instance, "document_file", None))
         external_url = attrs.get("external_url", getattr(self.instance, "external_url", ""))
@@ -984,6 +996,14 @@ class DocumentSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         uploaded_files = validated_data.pop("uploaded_files", [])
+        if not (validated_data.get("name") or "").strip():
+            primary = validated_data.get("document_file")
+            if primary:
+                validated_data["name"] = getattr(primary, "name", "Document").rsplit("/", 1)[-1]
+            elif uploaded_files:
+                validated_data["name"] = getattr(uploaded_files[0], "name", "Document").rsplit("/", 1)[-1]
+            else:
+                validated_data["name"] = "Document"
         document = Document.objects.create(**validated_data)
         self._save_extra_files(document, uploaded_files)
         return document
@@ -992,5 +1012,103 @@ class DocumentSerializer(serializers.ModelSerializer):
         uploaded_files = validated_data.pop("uploaded_files", [])
         instance = super().update(instance, validated_data)
         self._save_extra_files(instance, uploaded_files)
+        return instance
+
+class ExpenseCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ExpenseCategory
+        fields = ["id", "name", "description", "is_active", "created_at", "updated_at"]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class ExpenseFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = ExpenseFile
+        fields = ["id", "file", "file_url", "original_name", "created_at"]
+        read_only_fields = fields
+
+
+class ExpenseRelatedUserSerializer(serializers.ModelSerializer):
+    display_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = ["id", "email", "full_name", "display_name", "profile_photo"]
+        read_only_fields = fields
+
+    def get_display_name(self, obj):
+        return obj.full_name or obj.get_full_name() or obj.email
+
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    category = OwnerPrimaryKeyRelatedField(queryset=ExpenseCategory.objects.all(), required=False, allow_null=True)
+    related_user = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), required=False, allow_null=True)
+    uploaded_files = MultipleFileField(
+        child=serializers.FileField(),
+        required=False,
+        write_only=True,
+        allow_empty=True,
+    )
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    related_user_name = serializers.SerializerMethodField()
+    files = ExpenseFileSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Expense
+        fields = [
+            "id", "transaction_type", "amount", "name", "date",
+            "category", "category_name", "related_user", "related_user_name",
+            "uploaded_files", "files", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "category_name", "related_user_name", "files", "created_at", "updated_at",
+        ]
+        extra_kwargs = {
+            "name": {"required": False, "allow_blank": True},
+            "date": {"required": False},
+        }
+
+    def to_internal_value(self, data):
+        # Empty multipart values mean "no category / no related user".
+        if hasattr(data, "copy"):
+            data = data.copy()
+            for field in ("category", "related_user"):
+                if data.get(field) == "":
+                    data[field] = None
+        return super().to_internal_value(data)
+
+    def get_related_user_name(self, obj):
+        user = obj.related_user
+        if not user:
+            return ""
+        return user.full_name or user.get_full_name() or user.email
+
+    def validate_amount(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError("Amount must be greater than zero.")
+        return value
+
+    def _save_files(self, expense, uploads):
+        request = self.context.get("request")
+        for upload in uploads or []:
+            ExpenseFile.objects.create(
+                expense=expense,
+                file=upload,
+                original_name=getattr(upload, "name", ""),
+                uploaded_by=request.user if request else expense.owner,
+            )
+
+    def create(self, validated_data):
+        uploads = validated_data.pop("uploaded_files", [])
+        expense = Expense.objects.create(**validated_data)
+        self._save_files(expense, uploads)
+        return expense
+
+    def update(self, instance, validated_data):
+        uploads = validated_data.pop("uploaded_files", [])
+        instance = super().update(instance, validated_data)
+        self._save_files(instance, uploads)
         return instance
 

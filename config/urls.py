@@ -20,6 +20,7 @@ urlpatterns = [
     path("api/auth/", include("accounts.urls")),
     path("api/", include("workmanager.urls")),
     path("api/social/", include("connections.urls")),
+    path("api/property-management/", include("property_management.urls")),
 ]
 
 if settings.DEBUG:
