@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from django.core import signing
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Q
 from django.urls import reverse
@@ -655,16 +656,38 @@ class MeterAssignmentSerializer(serializers.ModelSerializer):
 class MeterSerializer(serializers.ModelSerializer):
     property = OwnedPKField(Property)
     property_name = serializers.CharField(source="property.name", read_only=True)
+    units = OwnedPKField(RentalUnit, many=True, required=False)
+    unit_details = serializers.SerializerMethodField()
     assignments = MeterAssignmentSerializer(many=True, read_only=True)
     last_reading = serializers.SerializerMethodField()
+    last_bill = serializers.SerializerMethodField()
 
     class Meta:
         model = Meter
         fields = [
-            "id", "property", "property_name", "meter_number", "name", "meter_type", "is_active", "notes",
-            "assignments", "last_reading",
+            "id", "property", "property_name", "meter_number", "name", "meter_type", "units", "unit_details",
+            "default_split", "is_active", "notes", "assignments", "last_reading", "last_bill",
         ]
         validators = []
+
+    def get_unit_details(self, obj):
+        period = services.month_start(services.today())
+        result = []
+        for unit in sorted(obj.units.all(), key=lambda u: u.name):
+            agreement = services.agreement_for_unit(unit, period)
+            result.append({
+                "id": unit.id,
+                "name": unit.name,
+                "agreement_id": agreement.id if agreement else None,
+                "tenant_name": agreement.tenant.full_name if agreement else None,
+            })
+        return result
+
+    def get_last_bill(self, obj):
+        bill = obj.bills.exclude(status=ElectricityBill.Status.CANCELLED).order_by("-period", "-id").first()
+        if not bill:
+            return None
+        return {"id": bill.id, "period": bill.period, "amount": str(bill.amount), "status": bill.status}
 
     def get_last_reading(self, obj):
         reading = obj.readings.order_by("-reading_date").first()
@@ -678,7 +701,78 @@ class MeterSerializer(serializers.ModelSerializer):
             qs = qs.exclude(pk=self.instance.pk)
         if qs.exists():
             raise serializers.ValidationError({"meter_number": "A meter with this number already exists here."})
+        units = attrs.get("units")
+        if units is not None and prop and any(u.property_id != prop.id for u in units):
+            raise serializers.ValidationError({"units": "Units must belong to the meter's property."})
         return attrs
+
+
+class MeterBillSerializer(serializers.Serializer):
+    """One month's bill for a meter. `lines` maps unit id -> {"units": ..} or {"amount": ..}."""
+
+    month = serializers.CharField()
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.01"))
+    method = serializers.ChoiceField(choices=ElectricityBill.Method.choices)
+    lines = serializers.JSONField(required=False, default=dict)
+    bill_date = serializers.DateField(required=False, allow_null=True)
+    due_date = serializers.DateField(required=False, allow_null=True)
+    total_units = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True, min_value=0)
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    attachment = serializers.FileField(required=False, allow_null=True)
+    preview = serializers.BooleanField(required=False, default=False)
+
+    def validate_month(self, value):
+        return _service_call(services.parse_month, value)
+
+    def validate_lines(self, value):
+        if isinstance(value, str):  # multipart forms send it as a JSON string
+            import json
+
+            try:
+                value = json.loads(value or "{}")
+            except ValueError:
+                raise serializers.ValidationError("Invalid lines.")
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Lines must map unit id to values.")
+        return value
+
+    def validate_attachment(self, value):
+        if value:
+            # Same file type/size rules as a bill uploaded the normal way.
+            for validator in ElectricityBill._meta.get_field("attachment").validators:
+                try:
+                    validator(value)
+                except DjangoValidationError as exc:
+                    raise serializers.ValidationError(exc.messages)
+        return value
+
+
+def split_to_json(split):
+    return {
+        "units": [
+            {
+                "unit_id": r["unit"].id,
+                "unit_name": r["unit"].name,
+                "agreement_id": r["agreement"].id if r["agreement"] else None,
+                "tenant_name": r["agreement"].tenant.full_name if r["agreement"] else None,
+                "units_used": str(r["units_used"]) if "units_used" in r else None,
+                "amount": str(r["amount"]),
+            }
+            for r in split["units"]
+        ],
+        "lines": [
+            {
+                "agreement_id": l["agreement"].id,
+                "tenant_name": l["agreement"].tenant.full_name,
+                "unit_names": l["unit_names"],
+                "units": str(l["units"]) if l["units"] is not None else None,
+                "amount": str(services.money(l["amount"])),
+            }
+            for l in split["lines"]
+        ],
+        "total": str(split["total"]),
+        "owner_pays": str(split["owner_pays"]),
+    }
 
 
 class MeterReadingSerializer(serializers.ModelSerializer):

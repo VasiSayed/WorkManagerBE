@@ -498,6 +498,11 @@ class Meter(PMOwnedModel):
     meter_number = models.CharField(max_length=60)
     name = models.CharField(max_length=100)
     meter_type = models.CharField(max_length=20, choices=MeterType.choices, default=MeterType.INDIVIDUAL)
+    # Units this meter supplies. Its monthly bill is split between the tenants of these units.
+    units = models.ManyToManyField(RentalUnit, blank=True, related_name="meters")
+    default_split = models.CharField(
+        max_length=10, choices=[("equal", "Equal split"), ("meter", "By units used"), ("manual", "Manual amounts")], default="equal"
+    )
     is_active = models.BooleanField(default=True)
     notes = models.TextField(blank=True)
 

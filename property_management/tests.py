@@ -637,6 +637,114 @@ class ElectricityTests(PMTestCase):
         self.assertEqual(bal["total_outstanding"], D("0.00"))
 
 
+class MeterMonthlyBillTests(PMTestCase):
+    """Meter -> linked units -> monthly bill split straight into each tenant's dues."""
+
+    def setUp(self):
+        super().setUp()
+        self.prop = self.make_property()
+        self.g1 = self.make_unit(self.prop, "G1")
+        self.g2 = self.make_unit(self.prop, "G2")
+        self.g3 = self.make_unit(self.prop, "G3")  # vacant
+        self.ta = self.make_tenant("Tenant A", "9876500001")
+        self.tb = self.make_tenant("Tenant B", "9876500002")
+
+    def meter(self, units):
+        return self.post("/electricity/meters/", {
+            "property": self.prop["id"], "name": "Main", "meter_number": "M-1", "meter_type": "shared",
+            "units": [u["id"] for u in units]})
+
+    def bill(self, meter, method, lines=None, amount="1000", status=201, **extra):
+        return self.post(f"/electricity/meters/{meter['id']}/bill/",
+                         {"month": "2026-10", "amount": amount, "method": method, "lines": lines or {}, **extra}, status=status)
+
+    def test_equal_split_adds_to_monthly_due(self):
+        a = self.make_agreement(self.prop, self.g1, self.ta)
+        b = self.make_agreement(self.prop, self.g2, self.tb)
+        m = self.meter([self.g1, self.g2, self.g3])
+        self.assertEqual([u["tenant_name"] for u in m["unit_details"]], ["Tenant A", "Tenant B", None])
+        res = self.bill(m, "equal")
+        self.assertEqual(sorted(l["amount"] for l in res["split"]["lines"]), ["500.00", "500.00"])
+        self.assertEqual(res["split"]["owner_pays"], "0.00")
+        self.assertEqual(res["bill"]["status"], "allocated")
+        # Shows in this month's amount due on Collect, together with the rent.
+        row = self.collection_row(a["id"])
+        self.assertEqual(D(row["amount_due"]), D("9500"))
+        self.assertIn("electricity", [l["type"] for l in row["lines"]])
+        self.assertEqual(D(self.collection_row(b["id"])["amount_due"]), D("9500"))
+
+    def test_by_units_vacant_share_paid_by_owner(self):
+        a = self.make_agreement(self.prop, self.g1, self.ta)
+        self.make_agreement(self.prop, self.g2, self.tb)
+        m = self.meter([self.g1, self.g2, self.g3])
+        lines = {str(self.g1["id"]): {"units": "100"}, str(self.g2["id"]): {"units": "50"}, str(self.g3["id"]): {"units": "50"}}
+        res = self.bill(m, "meter", lines)
+        amounts = {l["tenant_name"]: l["amount"] for l in res["split"]["lines"]}
+        self.assertEqual(amounts, {"Tenant A": "500.00", "Tenant B": "250.00"})
+        self.assertEqual(res["split"]["owner_pays"], "250.00")
+        self.assertEqual(res["bill"]["unallocated_amount"], "250.00")
+        missing = self.client.post(f"{BASE}/electricity/meters/{m['id']}/bill/",
+                                   {"month": "2026-11", "amount": "900", "method": "meter",
+                                    "lines": {str(self.g1["id"]): {"units": "10"}}}, format="json")
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(missing.data["code"], "units_required")
+        self.assertEqual(D(self.collection_row(a["id"])["amount_due"]), D("9500"))
+
+    def test_manual_amounts_and_over_allocation(self):
+        self.make_agreement(self.prop, self.g1, self.ta)
+        self.make_agreement(self.prop, self.g2, self.tb)
+        m = self.meter([self.g1, self.g2])
+        too_much = self.client.post(f"{BASE}/electricity/meters/{m['id']}/bill/", {
+            "month": "2026-10", "amount": "1000", "method": "manual",
+            "lines": {str(self.g1["id"]): {"amount": "800"}, str(self.g2["id"]): {"amount": "300"}}}, format="json")
+        self.assertEqual(too_much.status_code, 400)
+        self.assertEqual(too_much.data["code"], "over_allocated")
+        res = self.bill(m, "manual", {str(self.g1["id"]): {"amount": "300"}, str(self.g2["id"]): {"amount": "200"}})
+        self.assertEqual(res["split"]["owner_pays"], "500.00")
+        # The method used becomes the meter's default next month.
+        self.assertEqual(self.get(f"/electricity/meters/{m['id']}/")["default_split"], "manual")
+
+    def test_tenant_with_two_linked_units_gets_one_combined_charge(self):
+        a = self.make_agreement(self.prop, self.g1, self.ta, additional_units=[self.g2["id"]])
+        m = self.meter([self.g1, self.g2, self.g3])
+        res = self.bill(m, "equal")
+        self.assertEqual(len(res["split"]["lines"]), 1)
+        self.assertEqual(res["split"]["lines"][0]["amount"], "1000.00")
+        self.assertEqual(res["split"]["lines"][0]["unit_names"], ["G1", "G2"])
+        self.assertEqual(Charge.objects.filter(agreement_id=a["id"], charge_type="electricity").count(), 1)
+
+    def test_preview_saves_nothing_and_month_billed_once(self):
+        self.make_agreement(self.prop, self.g1, self.ta)
+        m = self.meter([self.g1])
+        preview = self.post(f"/electricity/meters/{m['id']}/bill/",
+                            {"month": "2026-10", "amount": "700", "method": "equal", "preview": True}, status=200)
+        self.assertEqual(preview["lines"][0]["amount"], "700.00")
+        self.assertEqual(ElectricityBill.objects.count(), 0)
+        setup = self.get(f"/electricity/meters/{m['id']}/split-setup/?month=2026-10")
+        self.assertIsNone(setup["existing_bill"])
+        self.bill(m, "equal", amount="700")
+        dup = self.client.post(f"{BASE}/electricity/meters/{m['id']}/bill/",
+                               {"month": "2026-10", "amount": "700", "method": "equal"}, format="json")
+        self.assertEqual(dup.status_code, 400)
+        self.assertEqual(dup.data["code"], "duplicate_bill")
+        self.assertIsNotNone(self.get(f"/electricity/meters/{m['id']}/split-setup/?month=2026-10")["existing_bill"])
+        self.assertEqual(len(self.get(f"/electricity/meters/{m['id']}/bills/")), 1)
+
+    def test_meter_needs_units_and_tenants(self):
+        m = self.meter([])
+        res = self.client.post(f"{BASE}/electricity/meters/{m['id']}/bill/",
+                               {"month": "2026-10", "amount": "500", "method": "equal"}, format="json")
+        self.assertEqual(res.data["code"], "no_units")
+        self.client.patch(f"{BASE}/electricity/meters/{m['id']}/", {"units": [self.g3["id"]]}, format="json")
+        res = self.client.post(f"{BASE}/electricity/meters/{m['id']}/bill/",
+                               {"month": "2026-10", "amount": "500", "method": "equal"}, format="json")
+        self.assertEqual(res.data["code"], "no_tenants")
+        other = self.make_property("Other")
+        far = self.make_unit(other, "X1")
+        bad = self.client.patch(f"{BASE}/electricity/meters/{m['id']}/", {"units": [far["id"]]}, format="json")
+        self.assertEqual(bad.status_code, 400)
+
+
 class UnifiedBalanceTests(PMTestCase):
     def test_example_from_spec(self):
         self.setup_basic()

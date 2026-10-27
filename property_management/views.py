@@ -51,6 +51,7 @@ from .serializers import (
     FloorSectionSerializer,
     FloorSerializer,
     MeterAssignmentSerializer,
+    MeterBillSerializer,
     MeterReadingSerializer,
     MeterSerializer,
     PaymentSerializer,
@@ -65,6 +66,7 @@ from .serializers import (
     ReviseRecurringSerializer,
     SettleDepositSerializer,
     TenantSerializer,
+    split_to_json,
 )
 
 
@@ -628,9 +630,63 @@ class ExpenseViewSet(OwnedViewSet):
 
 
 class MeterViewSet(OwnedViewSet):
-    queryset = Meter.objects.select_related("property").prefetch_related("assignments__agreement__tenant", "assignments__agreement__unit")
+    queryset = Meter.objects.select_related("property").prefetch_related(
+        "assignments__agreement__tenant", "assignments__agreement__unit", "units"
+    )
     serializer_class = MeterSerializer
     filter_map = {"property": "property_id", "is_active": "is_active", "meter_type": "meter_type"}
+
+    @decorators.action(detail=True, methods=["get"], url_path="split-setup")
+    def split_setup(self, request, pk=None):
+        """Who occupies each of the meter's units in a month, and whether that month is already billed."""
+        meter = self.get_object()
+        period = services.parse_month(request.query_params.get("month"))
+        units = []
+        for unit in sorted(meter.units.all(), key=lambda u: u.name):
+            agreement = services.agreement_for_unit(unit, period)
+            units.append({
+                "unit_id": unit.id,
+                "unit_name": unit.name,
+                "agreement_id": agreement.id if agreement else None,
+                "tenant_name": agreement.tenant.full_name if agreement else None,
+            })
+        existing = meter.bills.filter(period=period).exclude(status=ElectricityBill.Status.CANCELLED).first()
+        return response.Response({
+            "month": period.strftime("%Y-%m"),
+            "units": units,
+            "existing_bill": {"id": existing.id, "amount": str(existing.amount)} if existing else None,
+        })
+
+    @decorators.action(detail=True, methods=["post"])
+    def bill(self, request, pk=None):
+        """Add this month's bill: split it between the meter's units and add each share to the tenant's dues.
+        Send preview=true to see the split without saving."""
+        meter = self.get_object()
+        data = MeterBillSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        v = data.validated_data
+        if v["preview"]:
+            split = services.meter_bill_split(meter, v["month"], v["amount"], v["method"], v["lines"])
+            return response.Response(split_to_json(split))
+        bill, split = services.add_meter_bill(
+            meter=meter, period=v["month"], amount=v["amount"], method=v["method"], unit_lines=v["lines"],
+            bill_date=v.get("bill_date"), due_date=v.get("due_date"), total_units=v.get("total_units"),
+            notes=v.get("notes", ""), attachment=v.get("attachment"),
+        )
+        if meter.default_split != v["method"]:
+            meter.default_split = v["method"]
+            meter.save(update_fields=["default_split", "updated_at"])
+        bill = ElectricityBill.objects.select_related("property").prefetch_related("allocations").get(pk=bill.pk)
+        return response.Response(
+            {"bill": ElectricityBillSerializer(bill, context={"request": request}).data, "split": split_to_json(split)},
+            status=status.HTTP_201_CREATED,
+        )
+
+    @decorators.action(detail=True, methods=["get"])
+    def bills(self, request, pk=None):
+        meter = self.get_object()
+        bills = meter.bills.select_related("property").prefetch_related("allocations").order_by("-period", "-id")[:24]
+        return response.Response(ElectricityBillSerializer(bills, many=True, context={"request": request}).data)
 
 
 class MeterAssignmentViewSet(OwnedViewSet):

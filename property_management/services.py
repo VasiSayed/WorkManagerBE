@@ -32,6 +32,7 @@ from .models import (
     DepositTransaction,
     ElectricityAllocation,
     ElectricityBill,
+    Meter,
     MeterAssignment,
     MeterReading,
     Payment,
@@ -1170,31 +1171,161 @@ def allocate_bill(*, bill, method, agreements, lines=None, use_readings=False, c
             raise ServiceError(
                 "The allocation needs your confirmation.", code="confirmation_required", extra={"preview": preview}
             )
-        due = bill.due_date or bill.bill_date
-        for line in preview["lines"]:
-            if line["amount"] <= 0:
-                continue
-            agreement = line["agreement"]
-            allocation = ElectricityAllocation.objects.create(
-                owner=bill.owner, bill=bill, agreement=agreement, units=line["units"], amount=line["amount"]
-            )
-            Charge.objects.create(
-                owner=bill.owner,
-                agreement=agreement,
-                tenant_id=agreement.tenant_id,
-                property_id=bill.property_id,
-                charge_type=Charge.ChargeType.ELECTRICITY,
-                period=bill.period,
-                description=f"Electricity {month_label(bill.period)}",
-                amount=line["amount"],
-                due_date=due,
-                electricity_allocation=allocation,
-            )
-        bill.allocation_method = method
-        bill.status = ElectricityBill.Status.ALLOCATED
-        bill.unallocated_amount = preview["difference"]
-        bill.save(update_fields=["allocation_method", "status", "unallocated_amount", "updated_at"])
+        _record_allocations(bill, method, preview["lines"], preview["difference"])
     return bill, preview
+
+
+def _record_allocations(bill, method, lines, unallocated):
+    """Charge each tenant their share. Electricity is part of the month's amount due, shown with the rent."""
+    due = bill.due_date or bill.bill_date
+    for line in lines:
+        if line["amount"] <= 0:
+            continue
+        agreement = line["agreement"]
+        allocation = ElectricityAllocation.objects.create(
+            owner=bill.owner, bill=bill, agreement=agreement, units=line["units"], amount=line["amount"]
+        )
+        Charge.objects.create(
+            owner=bill.owner,
+            agreement=agreement,
+            tenant_id=agreement.tenant_id,
+            property_id=bill.property_id,
+            charge_type=Charge.ChargeType.ELECTRICITY,
+            period=bill.period,
+            description=f"Electricity {month_label(bill.period)}" + (f" ({bill.meter.name})" if bill.meter_id else ""),
+            amount=line["amount"],
+            due_date=due,
+            included_in_monthly_due=True,
+            electricity_allocation=allocation,
+        )
+    bill.allocation_method = method
+    bill.status = ElectricityBill.Status.ALLOCATED
+    bill.unallocated_amount = unallocated
+    bill.save(update_fields=["allocation_method", "status", "unallocated_amount", "updated_at"])
+
+
+def agreement_for_unit(unit, period):
+    """The agreement that has this unit (as main or additional unit) during the given month, if any."""
+    start, end = period, month_end(period)
+    return (
+        Agreement.objects.filter(Q(unit=unit) | Q(additional_units=unit), start_date__lte=end)
+        .filter(
+            Q(status=Agreement.Status.ACTIVE, billing_end_date__isnull=True)
+            | Q(billing_end_date__gte=start)
+            | Q(move_out_date__gte=start)
+        )
+        .select_related("tenant", "unit")
+        .prefetch_related("additional_units")
+        .order_by("-start_date", "-id")
+        .distinct()
+        .first()
+    )
+
+
+def _non_negative(value, label):
+    try:
+        result = Decimal(str(value))
+    except Exception:
+        raise ServiceError(f"Enter a valid number for {label}.", code="invalid_number")
+    if not result.is_finite() or result < 0:
+        raise ServiceError(f"{label.capitalize()} cannot be negative.", code="invalid_number")
+    return result
+
+
+def meter_bill_split(meter, period, amount, method, unit_lines=None):
+    """Split one month's bill for a meter between the units it supplies.
+
+    method: "equal" (occupied units share equally), "meter" (by units used per unit; a vacant unit's
+    share is paid by the owner) or "manual" (amount per occupied unit; anything left is paid by the owner).
+    unit_lines maps unit id -> {"units": ..} or {"amount": ..}.
+    """
+    amount = money(amount)
+    if amount <= 0:
+        raise ServiceError("Bill amount must be more than zero.", code="invalid_amount")
+    unit_lines = {int(k): (v or {}) for k, v in (unit_lines or {}).items()}
+    units = sorted(meter.units.all(), key=lambda u: u.name)
+    if not units:
+        raise ServiceError("Link this meter to the units it supplies first.", code="no_units")
+    rows = [{"unit": u, "agreement": agreement_for_unit(u, period), "amount": ZERO} for u in units]
+    occupied = [r for r in rows if r["agreement"]]
+    if not occupied:
+        raise ServiceError("None of this meter's units has a tenant in this month.", code="no_tenants")
+
+    if method == ElectricityBill.Method.EQUAL:
+        for r, share in zip(occupied, distribute(amount, [1] * len(occupied))):
+            r["amount"] = share
+    elif method == ElectricityBill.Method.METER:
+        for r in rows:
+            entered = unit_lines.get(r["unit"].id, {}).get("units")
+            if entered in (None, ""):
+                raise ServiceError(f"Enter units used for {r['unit'].name} (0 if none).", code="units_required")
+            r["units_used"] = _non_negative(entered, f"units for {r['unit'].name}")
+        weights = [r["units_used"] for r in rows]
+        if sum(weights) <= 0:
+            raise ServiceError("Total units used is zero. Use equal split or manual amounts.", code="zero_units")
+        for r, share in zip(rows, distribute(amount, weights)):
+            r["amount"] = share
+    elif method == ElectricityBill.Method.MANUAL:
+        for r in occupied:
+            entered = unit_lines.get(r["unit"].id, {}).get("amount")
+            if entered in (None, ""):
+                raise ServiceError(f"Enter an amount for {r['unit'].name}.", code="amount_required")
+            r["amount"] = money(_non_negative(entered, f"amount for {r['unit'].name}"))
+        allocated = sum((r["amount"] for r in occupied), ZERO)
+        if allocated > amount:
+            raise ServiceError(f"Amounts add up to ₹{money(allocated)}, more than the bill (₹{amount}).", code="over_allocated")
+    else:
+        raise ServiceError("Unknown split method.", code="invalid_method")
+
+    by_agreement = {}
+    for r in occupied:
+        line = by_agreement.setdefault(
+            r["agreement"].id, {"agreement": r["agreement"], "units": None, "amount": ZERO, "unit_names": []}
+        )
+        line["amount"] += r["amount"]
+        line["unit_names"].append(r["unit"].name)
+        if "units_used" in r:
+            line["units"] = (line["units"] or ZERO) + r["units_used"]
+    lines = list(by_agreement.values())
+    owner_pays = money(amount - sum((l["amount"] for l in lines), ZERO))
+    return {"units": rows, "lines": lines, "total": amount, "owner_pays": owner_pays}
+
+
+def add_meter_bill(*, meter, period, amount, method, unit_lines=None, bill_date=None, due_date=None,
+                   total_units=None, notes="", attachment=None):
+    """Record a meter's monthly bill and add each tenant's share to their dues in one step."""
+    period = month_start(period)
+    with transaction.atomic():
+        meter = Meter.objects.select_for_update().get(pk=meter.pk)
+        duplicate = ElectricityBill.objects.filter(meter=meter, period=period).exclude(status=ElectricityBill.Status.CANCELLED)
+        if duplicate.exists():
+            raise ServiceError(
+                f"{meter.name} already has a bill for {month_label(period)}. Open it to correct amounts, or cancel it first.",
+                code="duplicate_bill",
+            )
+        split = meter_bill_split(meter, period, amount, method, unit_lines)
+        bill = ElectricityBill.objects.create(
+            owner=meter.owner,
+            property_id=meter.property_id,
+            meter=meter,
+            period=period,
+            bill_date=bill_date or today(),
+            due_date=due_date,
+            amount=split["total"],
+            total_units=total_units,
+            notes=notes,
+            attachment=attachment,
+        )
+        _record_allocations(
+            bill,
+            method,
+            [
+                {"agreement": l["agreement"], "units": money(l["units"]) if l["units"] is not None else None, "amount": money(l["amount"])}
+                for l in split["lines"]
+            ],
+            split["owner_pays"],
+        )
+    return bill, split
 
 
 def correct_allocation(*, allocation, new_amount, reason):
