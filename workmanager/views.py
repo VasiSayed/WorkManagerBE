@@ -6,9 +6,11 @@ from decimal import Decimal, ROUND_HALF_UP
 from django.core.mail import EmailMessage
 from django.core.mail.backends.smtp import EmailBackend
 from django.db import transaction
-from django.db.models import Count, Q, Sum
+from django.db.models import Case, Count, DecimalField, F, Q, Sum, Value, When, Window
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import decorators, permissions, response, status, viewsets
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.views import APIView
 
 from connections.models import ConnectionInvitation, Notification
@@ -16,7 +18,7 @@ from connections.models import ConnectionInvitation, Notification
 from .email_utils import render_template_text
 from .models import (
         Note, NoteFolder, NoteShare, Document, DocumentCategory, DocumentFile,
-    Expense, ExpenseCategory, ExpenseFile,
+    Expense, ExpenseCategory, ExpenseContact, ExpenseFile, ExpenseTag,
     Attachment,
     DesignationHistory,
     EmailLog,
@@ -41,7 +43,7 @@ from .serializers import (
     EmailLogSerializer,
     EmailTemplateSerializer,
     NoteSerializer, NoteFolderSerializer, DocumentCategorySerializer, DocumentSerializer,
-    ExpenseCategorySerializer, ExpenseSerializer, ExpenseRelatedUserSerializer,
+    ExpenseCategorySerializer, ExpenseContactSerializer, ExpenseSerializer, ExpenseTagSerializer,
     EmailVariableSerializer,
     EmailTypeSerializer,
     FreelanceSourceSerializer,
@@ -1603,59 +1605,166 @@ class DocumentViewSet(OwnedModelViewSet):
         return queryset
 
 class ExpenseCategoryViewSet(OwnedModelViewSet):
-    queryset = ExpenseCategory.objects.all()
+    """Categories and their sub-categories (parent set). ?top=true lists main categories only."""
+
+    queryset = ExpenseCategory.objects.select_related("parent")
     serializer_class = ExpenseCategorySerializer
     search_fields = ["name", "description"]
     ordering_fields = ["name", "created_at", "updated_at"]
-
-    def apply_common_filters(self, queryset):
-        queryset = super().apply_common_filters(queryset)
-        value = self.request.query_params.get("is_active")
-        if value in ["true", "false"]:
-            queryset = queryset.filter(is_active=value == "true")
-        return queryset
-
-
-class ExpenseViewSet(OwnedModelViewSet):
-    queryset = Expense.objects.select_related("category", "related_user").prefetch_related("files")
-    serializer_class = ExpenseSerializer
-    search_fields = ["name", "category__name", "related_user__full_name", "related_user__email"]
-    ordering_fields = ["date", "amount", "created_at", "updated_at"]
+    pagination_class = None
 
     def apply_common_filters(self, queryset):
         queryset = super().apply_common_filters(queryset)
         params = self.request.query_params
-        transaction_type = params.get("transaction_type")
-        if transaction_type:
+        value = params.get("is_active")
+        if value in ["true", "false"]:
+            queryset = queryset.filter(is_active=value == "true")
+        if params.get("top") in ["true", "1"]:
+            queryset = queryset.filter(parent__isnull=True)
+        if params.get("parent"):
+            queryset = queryset.filter(parent_id=params["parent"])
+        return queryset
+
+
+def _ledger_totals():
+    zero = Value(Decimal("0.00"), output_field=DecimalField(max_digits=14, decimal_places=2))
+    return {
+        "given": Coalesce(Sum("expenses__amount", filter=Q(expenses__transaction_type=Expense.TransactionType.GIVEN)), zero),
+        "received": Coalesce(Sum("expenses__amount", filter=Q(expenses__transaction_type=Expense.TransactionType.RECEIVED)), zero),
+        "entries": Count("expenses", distinct=True),
+    }
+
+
+class ExpenseContactViewSet(OwnedModelViewSet):
+    """The user's own people/parties for the ledger, with total given/received to each."""
+
+    queryset = ExpenseContact.objects.all()
+    serializer_class = ExpenseContactSerializer
+    search_fields = ["name", "phone"]
+    ordering_fields = ["name", "created_at"]
+    pagination_class = None
+
+    def get_queryset(self):
+        return super().get_queryset().annotate(**_ledger_totals())
+
+
+class ExpenseTagViewSet(OwnedModelViewSet):
+    queryset = ExpenseTag.objects.all()
+    serializer_class = ExpenseTagSerializer
+    search_fields = ["name"]
+    ordering_fields = ["name", "created_at"]
+    pagination_class = None
+
+    def get_queryset(self):
+        return super().get_queryset().annotate(entries=Count("expenses", distinct=True))
+
+
+class ExpensePagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = "page_size"
+    max_page_size = 500
+
+
+class ExpenseViewSet(OwnedModelViewSet):
+    """Ledger of money given and received.
+
+    Filters: type, category (main or sub id), sub_category, contact, tag, date_from, date_to, month (YYYY-MM),
+    min_amount, max_amount, has_files, search. List rows carry a running `balance` (received - given) in date order.
+    """
+
+    queryset = Expense.objects.select_related("category", "sub_category", "contact", "related_user").prefetch_related(
+        "files", "tags"
+    )
+    serializer_class = ExpenseSerializer
+    search_fields = ["name", "notes", "category__name", "sub_category__name", "contact__name"]
+    ordering_fields = ["date", "amount", "created_at", "updated_at"]
+    pagination_class = ExpensePagination
+
+    def apply_common_filters(self, queryset):
+        queryset = super().apply_common_filters(queryset)
+        params = self.request.query_params
+        transaction_type = params.get("transaction_type") or params.get("type")
+        if transaction_type in Expense.TransactionType.values:
             queryset = queryset.filter(transaction_type=transaction_type)
         if params.get("category"):
-            queryset = queryset.filter(category_id=params["category"])
+            category_id = params["category"]
+            queryset = queryset.filter(Q(category_id=category_id) | Q(sub_category_id=category_id))
+        if params.get("sub_category"):
+            queryset = queryset.filter(sub_category_id=params["sub_category"])
         if params.get("standalone") in ["true", "1"]:
             queryset = queryset.filter(category__isnull=True)
+        if params.get("contact"):
+            queryset = queryset.filter(contact_id=params["contact"])
         if params.get("related_user"):
             queryset = queryset.filter(related_user_id=params["related_user"])
+        if params.get("tag"):
+            queryset = queryset.filter(id__in=Expense.objects.filter(tags__id=params["tag"]).values("id"))
+        if params.get("month"):
+            try:
+                start, end = month_bounds(params["month"])
+                queryset = queryset.filter(date__range=(start, end))
+            except (ValueError, TypeError):
+                pass
         if params.get("date_from"):
             queryset = queryset.filter(date__gte=params["date_from"])
         if params.get("date_to"):
             queryset = queryset.filter(date__lte=params["date_to"])
+        try:
+            if params.get("min_amount"):
+                queryset = queryset.filter(amount__gte=Decimal(params["min_amount"]))
+            if params.get("max_amount"):
+                queryset = queryset.filter(amount__lte=Decimal(params["max_amount"]))
+        except (ArithmeticError, ValueError):
+            pass
+        if params.get("has_files") in ["true", "1"]:
+            queryset = queryset.filter(id__in=ExpenseFile.objects.values("expense_id"))
         return queryset
+
+    def list(self, request, *args, **kwargs):
+        signed = Case(
+            When(transaction_type=Expense.TransactionType.RECEIVED, then=F("amount")),
+            default=-F("amount"),
+            output_field=DecimalField(max_digits=14, decimal_places=2),
+        )
+        queryset = self.filter_queryset(self.get_queryset()).annotate(
+            balance=Window(Sum(signed), order_by=[F("date").asc(), F("id").asc()])
+        )
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(page if page is not None else queryset, many=True)
+        return self.get_paginated_response(serializer.data) if page is not None else response.Response(serializer.data)
 
     @decorators.action(detail=False, methods=["get"])
     def summary(self, request):
-        queryset = self.get_queryset()
-        totals = queryset.values("transaction_type").annotate(total=Sum("amount"))
-        given = Decimal("0.00")
-        received = Decimal("0.00")
-        for row in totals:
-            if row["transaction_type"] == Expense.TransactionType.GIVEN:
-                given = money(row["total"])
-            elif row["transaction_type"] == Expense.TransactionType.RECEIVED:
-                received = money(row["total"])
+        """Totals for the current filters, plus per-category and per-contact breakdowns."""
+        queryset = self.filter_queryset(self.get_queryset())
+        given_q = Q(transaction_type=Expense.TransactionType.GIVEN)
+        received_q = Q(transaction_type=Expense.TransactionType.RECEIVED)
+        totals = queryset.aggregate(given=Sum("amount", filter=given_q), received=Sum("amount", filter=received_q), count=Count("id"))
+        given, received = money(totals["given"]), money(totals["received"])
+
+        def breakdown(field, name_field):
+            rows = (
+                queryset.order_by()
+                .values(field, name_field)
+                .annotate(given=Sum("amount", filter=given_q), received=Sum("amount", filter=received_q), count=Count("id"))
+            )
+            result = []
+            for row in rows:
+                g, r = money(row["given"]), money(row["received"])
+                result.append({
+                    "id": row[field], "name": row[name_field] or "", "given": str(g), "received": str(r),
+                    "net": str(money(r - g)), "count": row["count"],
+                })
+            return sorted(result, key=lambda x: -(Decimal(x["given"]) + Decimal(x["received"])))
+
         return response.Response({
             "given": str(given),
             "received": str(received),
             "net": str(money(received - given)),
+            "count": totals["count"],
             "formula": "received - given",
+            "by_category": breakdown("category_id", "category__name"),
+            "by_contact": breakdown("contact_id", "contact__name"),
         })
 
     @decorators.action(detail=True, methods=["delete"], url_path=r"files/(?P<file_id>\d+)")
@@ -1667,14 +1776,4 @@ class ExpenseViewSet(OwnedModelViewSet):
         file_record.file.delete(save=False)
         file_record.delete()
         return response.Response(status=status.HTTP_204_NO_CONTENT)
-
-
-class ExpenseRelatedUsersAPIView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request):
-        User = request.user.__class__
-        # Deliberately simple: expose the User model list without project/job/category filtering.
-        users = User.objects.all().order_by("full_name", "email", "id")
-        return response.Response(ExpenseRelatedUserSerializer(users, many=True, context={"request": request}).data)
 

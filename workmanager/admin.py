@@ -27,6 +27,8 @@ from .models import (
     Document,
     DocumentFile,
     ExpenseCategory,
+    ExpenseContact,
+    ExpenseTag,
     Expense,
     ExpenseFile,
 )
@@ -167,9 +169,21 @@ class DocumentAdmin(OwnerAdmin):
 
 @admin.register(ExpenseCategory)
 class ExpenseCategoryAdmin(OwnerAdmin):
-    list_display = ("name", "owner", "is_active", "updated_at")
+    list_display = ("name", "parent", "owner", "is_active", "updated_at")
     list_filter = ("is_active",)
     search_fields = ("name", "description")
+
+
+@admin.register(ExpenseContact)
+class ExpenseContactAdmin(OwnerAdmin):
+    list_display = ("name", "phone", "owner", "updated_at")
+    search_fields = ("name", "phone")
+
+
+@admin.register(ExpenseTag)
+class ExpenseTagAdmin(OwnerAdmin):
+    list_display = ("name", "owner")
+    search_fields = ("name",)
 
 
 class ExpenseFileInline(admin.TabularInline):

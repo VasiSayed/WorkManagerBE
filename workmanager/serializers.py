@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 from rest_framework import serializers
@@ -26,7 +28,7 @@ from .models import (
     Task,
     WorkMember,
     Note, NoteFolder, NoteShare, Document, DocumentCategory, DocumentFile,
-    Expense, ExpenseCategory, ExpenseFile,
+    Expense, ExpenseCategory, ExpenseContact, ExpenseFile, ExpenseTag,
 )
 
 
@@ -1015,10 +1017,82 @@ class DocumentSerializer(serializers.ModelSerializer):
         return instance
 
 class ExpenseCategorySerializer(serializers.ModelSerializer):
+    parent = OwnerPrimaryKeyRelatedField(queryset=ExpenseCategory.objects.all(), required=False, allow_null=True)
+    parent_name = serializers.CharField(source="parent.name", read_only=True, default="")
+
     class Meta:
         model = ExpenseCategory
-        fields = ["id", "name", "description", "is_active", "created_at", "updated_at"]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        fields = ["id", "name", "parent", "parent_name", "description", "is_active", "created_at", "updated_at"]
+        read_only_fields = ["id", "parent_name", "created_at", "updated_at"]
+
+    def validate_name(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Name is required.")
+        return value
+
+    def validate(self, attrs):
+        parent = attrs.get("parent", getattr(self.instance, "parent", None))
+        name = attrs.get("name", getattr(self.instance, "name", ""))
+        if parent is not None:
+            if parent.parent_id:
+                raise serializers.ValidationError({"parent": "Sub-categories cannot have their own sub-categories."})
+            if self.instance and (parent.pk == self.instance.pk or self.instance.subcategories.exists()):
+                raise serializers.ValidationError({"parent": "A category with sub-categories cannot become a sub-category."})
+        request = self.context.get("request")
+        if request:
+            clash = ExpenseCategory.objects.filter(owner=request.user, parent=parent, name__iexact=name)
+            if self.instance:
+                clash = clash.exclude(pk=self.instance.pk)
+            if clash.exists():
+                raise serializers.ValidationError({"name": "This name already exists here."})
+        return attrs
+
+
+class ExpenseContactSerializer(serializers.ModelSerializer):
+    given = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True, default=Decimal("0.00"))
+    received = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True, default=Decimal("0.00"))
+    entries = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = ExpenseContact
+        fields = ["id", "name", "phone", "notes", "given", "received", "entries", "created_at", "updated_at"]
+        read_only_fields = ["id", "given", "received", "entries", "created_at", "updated_at"]
+
+    def validate_name(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Name is required.")
+        request = self.context.get("request")
+        if request:
+            clash = ExpenseContact.objects.filter(owner=request.user, name__iexact=value)
+            if self.instance:
+                clash = clash.exclude(pk=self.instance.pk)
+            if clash.exists():
+                raise serializers.ValidationError("You already have a contact with this name.")
+        return value
+
+
+class ExpenseTagSerializer(serializers.ModelSerializer):
+    entries = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = ExpenseTag
+        fields = ["id", "name", "entries", "created_at"]
+        read_only_fields = ["id", "entries", "created_at"]
+
+    def validate_name(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Name is required.")
+        request = self.context.get("request")
+        if request:
+            clash = ExpenseTag.objects.filter(owner=request.user, name__iexact=value)
+            if self.instance:
+                clash = clash.exclude(pk=self.instance.pk)
+            if clash.exists():
+                raise serializers.ValidationError("This tag already exists.")
+        return value
 
 
 class ExpenseFileSerializer(serializers.ModelSerializer):
@@ -1044,6 +1118,11 @@ class ExpenseRelatedUserSerializer(serializers.ModelSerializer):
 
 class ExpenseSerializer(serializers.ModelSerializer):
     category = OwnerPrimaryKeyRelatedField(queryset=ExpenseCategory.objects.all(), required=False, allow_null=True)
+    sub_category = OwnerPrimaryKeyRelatedField(queryset=ExpenseCategory.objects.all(), required=False, allow_null=True)
+    contact = OwnerPrimaryKeyRelatedField(queryset=ExpenseContact.objects.all(), required=False, allow_null=True)
+    tags = OwnerPrimaryKeyRelatedField(queryset=ExpenseTag.objects.all(), many=True, required=False)
+    # Type tag names freely; unknown names become new tags for this user.
+    tag_names = MultipleFileField(child=serializers.CharField(max_length=60), required=False, write_only=True, allow_empty=True)
     related_user = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), required=False, allow_null=True)
     uploaded_files = MultipleFileField(
         child=serializers.FileField(),
@@ -1052,18 +1131,25 @@ class ExpenseSerializer(serializers.ModelSerializer):
         allow_empty=True,
     )
     category_name = serializers.CharField(source="category.name", read_only=True)
+    sub_category_name = serializers.CharField(source="sub_category.name", read_only=True, default="")
+    contact_name = serializers.CharField(source="contact.name", read_only=True, default="")
+    tag_list = serializers.SerializerMethodField()
     related_user_name = serializers.SerializerMethodField()
     files = ExpenseFileSerializer(many=True, read_only=True)
+    balance = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True, required=False)
 
     class Meta:
         model = Expense
         fields = [
-            "id", "transaction_type", "amount", "name", "date",
-            "category", "category_name", "related_user", "related_user_name",
-            "uploaded_files", "files", "created_at", "updated_at",
+            "id", "transaction_type", "amount", "name", "date", "notes",
+            "category", "category_name", "sub_category", "sub_category_name",
+            "contact", "contact_name", "tags", "tag_names", "tag_list",
+            "related_user", "related_user_name",
+            "uploaded_files", "files", "balance", "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id", "category_name", "related_user_name", "files", "created_at", "updated_at",
+            "id", "category_name", "sub_category_name", "contact_name", "tag_list", "related_user_name", "files",
+            "balance", "created_at", "updated_at",
         ]
         extra_kwargs = {
             "name": {"required": False, "allow_blank": True},
@@ -1074,10 +1160,45 @@ class ExpenseSerializer(serializers.ModelSerializer):
         # Empty multipart values mean "no category / no related user".
         if hasattr(data, "copy"):
             data = data.copy()
-            for field in ("category", "related_user"):
+            for field in ("category", "sub_category", "contact", "related_user"):
                 if data.get(field) == "":
                     data[field] = None
         return super().to_internal_value(data)
+
+    def get_tag_list(self, obj):
+        return [{"id": t.id, "name": t.name} for t in obj.tags.all()]
+
+    def validate(self, attrs):
+        category = attrs.get("category", getattr(self.instance, "category", None))
+        sub = attrs.get("sub_category", getattr(self.instance, "sub_category", None))
+        if category is not None and category.parent_id:
+            # A sub-category was picked as the category: store it properly.
+            sub, category = category, category.parent
+            attrs["category"], attrs["sub_category"] = category, sub
+        if sub is not None:
+            if not sub.parent_id:
+                raise serializers.ValidationError({"sub_category": "Choose a sub-category, not a main category."})
+            if category is None:
+                attrs["category"] = sub.parent
+            elif sub.parent_id != category.id:
+                raise serializers.ValidationError({"sub_category": "This sub-category belongs to another category."})
+        if "category" in attrs and attrs["category"] is None and "sub_category" not in attrs:
+            attrs["sub_category"] = None
+        return attrs
+
+    def _apply_tags(self, expense, tags, tag_names):
+        if tags is None and tag_names is None:
+            return
+        chosen = list(tags or [])
+        for name in tag_names or []:
+            name = name.strip()
+            if not name:
+                continue
+            tag = ExpenseTag.objects.filter(owner=expense.owner, name__iexact=name).first()
+            if tag is None:
+                tag = ExpenseTag.objects.create(owner=expense.owner, name=name[:60])
+            chosen.append(tag)
+        expense.tags.set({t.id: t for t in chosen}.values())
 
     def get_related_user_name(self, obj):
         user = obj.related_user
@@ -1102,13 +1223,19 @@ class ExpenseSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         uploads = validated_data.pop("uploaded_files", [])
+        tags = validated_data.pop("tags", None)
+        tag_names = validated_data.pop("tag_names", None)
         expense = Expense.objects.create(**validated_data)
+        self._apply_tags(expense, tags, tag_names)
         self._save_files(expense, uploads)
         return expense
 
     def update(self, instance, validated_data):
         uploads = validated_data.pop("uploaded_files", [])
+        tags = validated_data.pop("tags", None)
+        tag_names = validated_data.pop("tag_names", None)
         instance = super().update(instance, validated_data)
+        self._apply_tags(instance, tags, tag_names)
         self._save_files(instance, uploads)
         return instance
 

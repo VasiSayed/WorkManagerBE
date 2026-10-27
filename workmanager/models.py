@@ -902,16 +902,53 @@ def expense_upload_path(instance, filename):
 
 
 class ExpenseCategory(OwnedModel):
+    """A category, or a sub-category when `parent` is set (two levels only)."""
+
     name = models.CharField(max_length=120)
+    parent = models.ForeignKey(
+        "self", on_delete=models.CASCADE, null=True, blank=True, related_name="subcategories"
+    )
     description = models.TextField(blank=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:
         ordering = ["name"]
         constraints = [
-            models.UniqueConstraint(fields=["owner", "name"], name="unique_expense_category_owner_name"),
+            models.UniqueConstraint(
+                fields=["owner", "name"], condition=models.Q(parent__isnull=True), name="unique_expense_category_owner_name"
+            ),
+            models.UniqueConstraint(
+                fields=["owner", "parent", "name"], condition=models.Q(parent__isnull=False),
+                name="unique_expense_subcategory_owner_parent_name",
+            ),
         ]
         indexes = [models.Index(fields=["owner", "is_active"], name="wm_exp_cat_owner_act_idx")]
+
+    def __str__(self):
+        return f"{self.parent.name} › {self.name}" if self.parent_id else self.name
+
+
+class ExpenseContact(OwnedModel):
+    """A person or party the user gives money to or receives money from. Private to that user."""
+
+    name = models.CharField(max_length=150)
+    phone = models.CharField(max_length=30, blank=True)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [models.UniqueConstraint(fields=["owner", "name"], name="unique_expense_contact_owner_name")]
+
+    def __str__(self):
+        return self.name
+
+
+class ExpenseTag(OwnedModel):
+    name = models.CharField(max_length=60)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [models.UniqueConstraint(fields=["owner", "name"], name="unique_expense_tag_owner_name")]
 
     def __str__(self):
         return self.name
@@ -933,6 +970,19 @@ class Expense(OwnedModel):
         blank=True,
         related_name="expenses",
     )
+    sub_category = models.ForeignKey(
+        ExpenseCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sub_expenses",
+    )
+    contact = models.ForeignKey(
+        ExpenseContact, on_delete=models.SET_NULL, null=True, blank=True, related_name="expenses"
+    )
+    tags = models.ManyToManyField(ExpenseTag, blank=True, related_name="expenses")
+    notes = models.TextField(blank=True)
+    # Kept for older entries; new entries use `contact`.
     related_user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
