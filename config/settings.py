@@ -32,6 +32,10 @@ FRONTEND_ORIGINS = config(
 
 CORS_ALLOWED_ORIGINS = list(FRONTEND_ORIGINS)
 
+# FindIt QR labels encode <this>/q/<uuid>. Printed labels depend on it: do not change it after printing
+# (if the site moves, keep this domain redirecting to the new one).
+FINDIT_SCAN_BASE_URL = config("FINDIT_SCAN_BASE_URL", default="https://work-manager-vasi-sayed.vercel.app")
+
 CSRF_TRUSTED_ORIGINS = list(FRONTEND_ORIGINS)
 
 CORS_ALLOW_CREDENTIALS = True
@@ -57,6 +61,7 @@ INSTALLED_APPS = [
     "workmanager",
     "connections",
     "property_management",
+    "findit",
 ]
 
 
@@ -72,6 +77,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "accounts.middleware.ModuleAccessMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -195,7 +201,10 @@ REST_FRAMEWORK = {
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(days=1),
-    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    # Family members stay signed in: the app renews the access token, and each renewal
+    # issues a fresh refresh token, so anyone who opens it at least every 90 days stays logged in.
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=90),
+    "ROTATE_REFRESH_TOKENS": True,
     "AUTH_HEADER_TYPES": ("Bearer",),
 }
 

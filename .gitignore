@@ -31,3 +31,6 @@ logs/
 # Local DB backups and test uploads
 *.sqlite3.bak*
 test_media_pm/
+
+# FindIt photos (private, never committed)
+private_media/

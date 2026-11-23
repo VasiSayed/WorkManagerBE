@@ -1,7 +1,15 @@
 from django.urls import path
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from .views import ChangePasswordAPIView, ForgotPasswordAPIView, MeAPIView, RegisterAPIView, ResetPasswordAPIView
+from .views import (
+    ChangePasswordAPIView,
+    ForgotPasswordAPIView,
+    MeAPIView,
+    RegisterAPIView,
+    ResetPasswordAPIView,
+    UserAccessListAPIView,
+    UserModulesAPIView,
+)
 
 urlpatterns = [
     path("register/", RegisterAPIView.as_view(), name="auth-register"),
@@ -11,4 +19,6 @@ urlpatterns = [
     path("change-password/", ChangePasswordAPIView.as_view(), name="change-password"),
     path("forgot-password/", ForgotPasswordAPIView.as_view(), name="forgot-password"),
     path("reset-password/", ResetPasswordAPIView.as_view(), name="reset-password"),
+    path("users/", UserAccessListAPIView.as_view(), name="auth-users"),
+    path("users/<int:user_id>/modules/", UserModulesAPIView.as_view(), name="auth-user-modules"),
 ]

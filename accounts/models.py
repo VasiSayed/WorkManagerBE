@@ -58,3 +58,18 @@ class User(AbstractUser):
 
     def __str__(self):
         return self.full_name or self.email
+
+
+class UserModuleAccess(models.Model):
+    """One row per module a user may use (see accounts.modules). Admins have every module."""
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="module_access")
+    module = models.CharField(max_length=30)
+    granted_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["user_id", "module"]
+        constraints = [models.UniqueConstraint(fields=["user", "module"], name="unique_user_module_access")]
+
+    def __str__(self):
+        return f"{self.user} → {self.module}"

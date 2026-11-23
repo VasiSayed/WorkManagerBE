@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
-from .models import User
+from .models import User, UserModuleAccess
 
 
 @admin.register(User)
@@ -17,3 +17,10 @@ class CustomUserAdmin(UserAdmin):
             "fields": ("email", "full_name", "password1", "password2", "is_staff", "is_active"),
         }),
     )
+
+
+@admin.register(UserModuleAccess)
+class UserModuleAccessAdmin(admin.ModelAdmin):
+    list_display = ("user", "module", "granted_at")
+    list_filter = ("module",)
+    search_fields = ("user__email", "user__full_name")

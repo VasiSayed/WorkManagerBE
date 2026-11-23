@@ -2,14 +2,28 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
+from .modules import MODULE_KEYS, is_admin, user_modules
+
 User = get_user_model()
 
 
 class UserSerializer(serializers.ModelSerializer):
+    modules = serializers.SerializerMethodField()
+    is_admin = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ["id", "username", "email", "full_name", "first_name", "last_name", "phone", "profile_photo"]
-        read_only_fields = ["id", "email"]
+        fields = [
+            "id", "username", "email", "full_name", "first_name", "last_name", "phone", "profile_photo",
+            "modules", "is_admin",
+        ]
+        read_only_fields = ["id", "email", "modules", "is_admin"]
+
+    def get_modules(self, obj):
+        return user_modules(obj)
+
+    def get_is_admin(self, obj):
+        return is_admin(obj)
 
     def validate_username(self, value):
         value = (value or "").strip()
@@ -78,3 +92,25 @@ class ForgotPasswordSerializer(serializers.Serializer):
 class ResetPasswordSerializer(serializers.Serializer):
     token = serializers.CharField()
     new_password = serializers.CharField(write_only=True, validators=[validate_password])
+
+
+class UserAccessSerializer(serializers.ModelSerializer):
+    """Admin view of a user and the modules they can use."""
+
+    modules = serializers.SerializerMethodField()
+    is_admin = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = ["id", "email", "full_name", "is_active", "date_joined", "last_login", "modules", "is_admin"]
+        read_only_fields = fields
+
+    def get_modules(self, obj):
+        return user_modules(obj)
+
+    def get_is_admin(self, obj):
+        return is_admin(obj)
+
+
+class ModuleListSerializer(serializers.Serializer):
+    modules = serializers.ListField(child=serializers.ChoiceField(choices=MODULE_KEYS), allow_empty=True)

@@ -21,6 +21,7 @@ urlpatterns = [
     path("api/", include("workmanager.urls")),
     path("api/social/", include("connections.urls")),
     path("api/property-management/", include("property_management.urls")),
+    path("api/findit/", include("findit.urls")),
 ]
 
 if settings.DEBUG:
